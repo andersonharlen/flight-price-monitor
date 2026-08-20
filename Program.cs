@@ -1,47 +1,129 @@
-using System;
-using System.Net.Http;
-using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using System.Text.Json;
+using System.Text;
 
-string phone = Environment.GetEnvironmentVariable("WHATSAPP_PHONE") ?? "5500000000000";
-string apiKey = Environment.GetEnvironmentVariable("CALLMEBOT_API_KEY") ?? "123456";
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
 
-string origin = "GRU";
-string destination = "FLN";
-decimal targetPrice = 300.00m;
+// Dicionários em memória para gerenciar a sessão do chat e os alertas salvos
+var sessoesUsuarios = new Dictionary<string, SessaoUsuario>();
+var alertasVoos = new List<AlertaVoo>();
 
-Console.WriteLine($"[LOG] Iniciando verificação de passagens: {origin} -> {destination}");
+const string EvolutionApiUrl = "http://localhost:8080";
+const string ApiKey = "minhasuperchave123";
+const string InstanceName = "voos";
 
-// Simulação de busca de preço
-decimal currentPrice = new Random().Next(180, 450); 
-
-Console.WriteLine($"[LOG] Preço Alvo: R$ {targetPrice:F2} | Preço Encontrado: R$ {currentPrice:F2}");
-
-if (currentPrice <= targetPrice)
+// 1. Endpoint do Webhook que recebe as mensagens do WhatsApp
+app.MapPost("/webhook", async ([FromBody] JsonElement payload) =>
 {
-    using var client = new HttpClient();
-    
-    string message = Uri.EscapeDataString(
-        $"🚨 *ALERTA DE PASSAGEM!* ✈️\n\n" +
-        $"Rota: *{origin}* ➔ *{destination}*\n" +
-        $"Preço encontrado: *R$ {currentPrice:F2}*\n\n" +
-        $"Garanta a sua antes que suba!"
-    );
-
-    string url = $"https://api.callmebot.com/whatsapp.php?phone={phone}&text={message}&apikey={apiKey}";
-
-    Console.WriteLine("[LOG] Preço abaixo do limite! Disparando notificação...");
-    var response = await client.GetAsync(url);
-
-    if (response.IsSuccessStatusCode)
+    try
     {
-        Console.WriteLine("[SUCCESS] Mensagem enviada para o WhatsApp com sucesso!");
+        if (payload.TryGetProperty("event", out var ev) && ev.GetString() == "messages.upsert")
+        {
+            var data = payload.GetProperty("data");
+            var remoteJid = data.GetProperty("key").GetProperty("remoteJid").GetString()!;
+            var numeroLimpo = remoteJid.Split('@')[0];
+
+            // Tenta pegar o texto da mensagem normal ou estendida
+            string? textoMensagem = null;
+            if (data.TryGetProperty("message", out var msgObj))
+            {
+                if (msgObj.TryGetProperty("conversation", out var conv))
+                    textoMensagem = conv.GetString();
+                else if (msgObj.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var extText))
+                    textoMensagem = extText.GetString();
+            }
+
+            if (!string.IsNullOrEmpty(textoMensagem))
+            {
+                await ProcessarFluxoBotAsync(numeroLimpo, textoMensagem.Trim());
+            }
+        }
     }
-    else
+    catch (Exception ex)
     {
-        Console.WriteLine($"[ERROR] Falha ao enviar WhatsApp. Status: {response.StatusCode}");
+        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
+    }
+
+    return Results.Ok(new { status = "ok" });
+});
+
+app.Run("http://localhost:3000");
+
+// --- LÓGICA DO BOT ---
+
+async Task ProcessarFluxoBotAsync(string numero, string texto)
+{
+    if (!sessoesUsuarios.ContainsKey(numero))
+    {
+        sessoesUsuarios[numero] = new SessaoUsuario();
+    }
+
+    var sessao = sessoesUsuarios[numero];
+    var textoLower = texto.ToLower();
+
+    if (textoLower is "oi" or "olá" or "menu" or "começar" || sessao.Estado == "INICIAL")
+    {
+        sessao.Estado = "AGUARDANDO_ORIGEM";
+        sessao.DadosTemp = new AlertaVoo();
+        await EnviarMensagemWhatsAppAsync(numero, "✈️ *Bem-vindo ao Flight Monitor!*\n\nQual é a cidade/aeroporto de **ORIGEM**?");
+        return;
+    }
+
+    if (sessao.Estado == "AGUARDANDO_ORIGEM")
+    {
+        sessao.DadosTemp.Origem = texto;
+        sessao.Estado = "AGUARDANDO_DESTINO";
+        await EnviarMensagemWhatsAppAsync(numero, $"Origem: *{texto}*.\n\nAgora, qual é o **DESTINO** desejado?");
+        return;
+    }
+
+    if (sessao.Estado == "AGUARDANDO_DESTINO")
+    {
+        sessao.DadosTemp.Destino = texto;
+        sessao.Estado = "AGUARDANDO_PRECO";
+        await EnviarMensagemWhatsAppAsync(numero, $"Destino: *{texto}*.\n\nQual é o **valor máximo (R$)** que você aceita pagar?");
+        return;
+    }
+
+    if (sessao.Estado == "AGUARDANDO_PRECO")
+    {
+        sessao.DadosTemp.PrecoMaximo = texto;
+        sessao.DadosTemp.Numero = numero;
+
+        alertasVoos.Add(sessao.DadosTemp);
+        sessao.Estado = "INICIAL";
+
+        await EnviarMensagemWhatsAppAsync(numero, $"✅ *Alerta cadastrado com sucesso!*\n\n" +
+                                                 $"🔍 Origem: {sessao.DadosTemp.Origem}\n" +
+                                                 $"🎯 Destino: {sessao.DadosTemp.Destino}\n" +
+                                                 $"💰 Até: R$ {sessao.DadosTemp.PrecoMaximo}\n\n" +
+                                                 $"Te avisarei quando houver promoções!");
     }
 }
-else
+
+async Task EnviarMensagemWhatsAppAsync(string numero, string texto)
 {
-    Console.WriteLine("[LOG] Preço acima do limite. Nenhum alerta necessário.");
+    using var client = new HttpClient();
+    client.DefaultRequestHeaders.Add("apikey", ApiKey);
+
+    var payload = new { number = numero, text = texto };
+    var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+    await client.PostAsync($"{EvolutionApiUrl}/message/sendText/{InstanceName}", content);
+}
+
+// Modelos de Dados
+class SessaoUsuario
+{
+    public string Estado { get; set; } = "INICIAL";
+    public AlertaVoo DadosTemp { get; set; } = new();
+}
+
+class AlertaVoo
+{
+    public string Numero { get; set; } = "";
+    public string Origem { get; set; } = "";
+    public string Destino { get; set; } = "";
+    public string PrecoMaximo { get; set; } = "";
 }
