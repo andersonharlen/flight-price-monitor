@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "origin": "GRU",
+    "destination": "FLN",
+    "departureDate": "2026-11-20",
+    "targetPrice": 400.00,
+    "active": true
+  },
+  {
+    "id": 2,
+    "origin": "GRU",
+    "destination": "SSA",
+    "departureDate": "2026-12-15",
+    "targetPrice": 650.00,
+    "active": true
+  }
+]
