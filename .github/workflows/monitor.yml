@@ -1,28 +1,26 @@
-name: Flight Price Monitor & WhatsApp Alert
+name: Flight Monitor Bot
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    # Roda a cada 1 hora (você pode ajustar conforme preferir)
+    - cron: '0 * * * *'
+  workflow_dispatch: # Permite rodar manualmente pelo site do GitHub
 
 jobs:
-  run-monitor:
-    runs-on: ubuntu-latest
+    run-monitor:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout do Código
+          uses: actions/checkout@v4
 
-    steps:
-    - name: Checkout do código
-      uses: actions/checkout@v4
+        - name: Setup .NET SDK
+          uses: actions/setup-dotnet@v4
+          with:
+            dotnet-version: '8.0'
 
-    - name: Configurar .NET 8
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '8.0.x'
-
-    - name: Restaurar dependências
-      run: dotnet restore
-
-    - name: Executar Robô de Monitoramento
-      env:
-        WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
-        CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
-      run: dotnet run --configuration Release --no-restore
+        - name: Executar Monitor de Voos
+          env:
+            EVOLUTION_API_URL: ${{ secrets.EVOLUTION_API_URL }}
+            EVOLUTION_API_KEY: ${{ secrets.EVOLUTION_API_KEY }}
+          run: |
+            dotnet run --project FlightMonitor.csproj
