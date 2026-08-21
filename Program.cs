@@ -30,42 +30,43 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        // Trata a variação da Evolution API (data como Array ou Objeto)
         JsonElement itemData = root;
-
         if (root.TryGetProperty("data", out var dataElem))
         {
             if (dataElem.ValueKind == JsonValueKind.Array && dataElem.GetArrayLength() > 0)
-            {
                 itemData = dataElem[0];
-            }
             else if (dataElem.ValueKind == JsonValueKind.Object)
-            {
                 itemData = dataElem;
-            }
         }
 
-        // Garante que o elemento possui a chave 'key'
-        if (itemData.ValueKind == JsonValueKind.Object && itemData.TryGetProperty("key", out var keyElem) && keyElem.ValueKind == JsonValueKind.Object)
+        if (itemData.ValueKind == JsonValueKind.Object && itemData.TryGetProperty("key", out var keyElem))
         {
             bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
             if (fromMe) return Results.Ok(new { status = "ignored_self" });
 
-            string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? (rj.GetString() ?? "") : "";
-            string telefone = remoteJid.Split('@')[0];
+            // Identifica o número correto (trata chats privados e grupos)
+            string rawJid = "";
+            if (itemData.TryGetProperty("participant", out var part) && !string.IsNullOrEmpty(part.GetString()))
+                rawJid = part.GetString()!;
+            else if (keyElem.TryGetProperty("participant", out var keyPart) && !string.IsNullOrEmpty(keyPart.GetString()))
+                rawJid = keyPart.GetString()!;
+            else if (keyElem.TryGetProperty("remoteJid", out var rj))
+                rawJid = rj.GetString() ?? "";
 
-            // Extrai o texto da mensagem com segurança
+            string telefone = rawJid.Split('@')[0].Split(':')[0];
+
+            // Extrai o texto varrendo todas as estruturas possíveis da Evolution API
             string textoMensagem = "";
-            if (itemData.TryGetProperty("message", out var msgElem) && msgElem.ValueKind == JsonValueKind.Object)
+            if (itemData.TryGetProperty("message", out var msgElem))
             {
-                if (msgElem.TryGetProperty("conversation", out var conv)) 
-                    textoMensagem = conv.GetString() ?? "";
-                else if (msgElem.TryGetProperty("extendedTextMessage", out var ext) && ext.ValueKind == JsonValueKind.Object && ext.TryGetProperty("text", out var txt)) 
-                    textoMensagem = txt.GetString() ?? "";
+                textoMensagem = ExtrairTextoDaMensagem(msgElem);
             }
 
             textoMensagem = textoMensagem.Trim();
             Console.WriteLine($"[WHATSAPP RECEBIDO] De: {telefone} | Texto: '{textoMensagem}'");
+
+            if (string.IsNullOrEmpty(textoMensagem))
+                return Results.Ok(new { status = "empty_text" });
 
             // 1. Comando CADASTRAR (ex: CADASTRAR MGF-AJU 800)
             if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
@@ -75,7 +76,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
                 {
                     string trecho = partes[1].ToUpper();
                     await CadastrarVooNoGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
-                    Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado no GitHub para {telefone}");
+                    Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone}");
                 }
             }
             // 2. Comando BUSCAR
@@ -112,6 +113,30 @@ _ = Task.Run(async () =>
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
+
+// --- EXTRATOR DE TEXTO MULTICAMADAS ---
+static string ExtrairTextoDaMensagem(JsonElement msg)
+{
+    if (msg.ValueKind != JsonValueKind.Object) return "";
+
+    // Mensagens temporárias
+    if (msg.TryGetProperty("ephemeralMessage", out var eph) && eph.TryGetProperty("message", out var ephMsg))
+        msg = ephMsg;
+
+    // Texto simples
+    if (msg.TryGetProperty("conversation", out var conv) && conv.ValueKind == JsonValueKind.String)
+        return conv.GetString() ?? "";
+
+    // Texto estendido / Formatado
+    if (msg.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var txt) && txt.ValueKind == JsonValueKind.String)
+        return txt.GetString() ?? "";
+
+    // Resposta de botões
+    if (msg.TryGetProperty("buttonsResponseMessage", out var btn) && btn.TryGetProperty("selectedButtonId", out var btnId))
+        return btnId.GetString() ?? "";
+
+    return "";
+}
 
 // --- LÓGICA DE CADASTRO E ENVIO ---
 static async Task CadastrarVooNoGitHubAsync(HttpClient client, string owner, string repo, string path, string token, string trecho, decimal precoTeto, string telefone)
