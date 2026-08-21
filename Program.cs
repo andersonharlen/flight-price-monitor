@@ -19,7 +19,7 @@ var instanceName = "voos";
 
 using var httpClient = new HttpClient();
 
-// --- 1. WEBHOOK (RECEBE MENSAGENS E COMANDOS) ---
+// --- 1. WEBHOOK ---
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
@@ -50,7 +50,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
             string textoMensagem = "";
             if (itemData.TryGetProperty("message", out var msgElem))
             {
-                textoMensagem = ExtrairTextoRecursivo(msgElem);
+                textoMensagem = ExtrairTextoMensagem(msgElem);
             }
 
             textoMensagem = textoMensagem.Trim();
@@ -66,7 +66,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
                 {
                     string trecho = partes[1].ToUpper();
                     bool ok = await SalvarCadastroComRetryAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
-                    Console.WriteLine(ok ? $"[SUCESSO] Voo {trecho} cadastrado no GitHub para {telefone}" : $"[ERRO] Falha ao cadastrar no GitHub.");
+                    Console.WriteLine(ok ? $"[SUCESSO] Voo {trecho} cadastrado para {telefone}" : $"[ERRO] Falha ao cadastrar no GitHub.");
                 }
             }
             // Comando BUSCAR
@@ -87,7 +87,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
 // --- 2. WORKER EM SEGUNDO PLANO ---
 _ = Task.Run(async () =>
 {
-    var timerAlertaAutomático = DateTime.MinValue;
+    var timerAlertaAutomatico = DateTime.MinValue;
 
     while (true)
     {
@@ -95,9 +95,9 @@ _ = Task.Run(async () =>
         {
             await ProcessarPendenciasGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
 
-            if (DateTime.UtcNow - timerAlertaAutomático > TimeSpan.FromHours(1))
+            if (DateTime.UtcNow - timerAlertaAutomatico > TimeSpan.FromHours(1))
             {
-                timerAlertaAutomático = DateTime.UtcNow;
+                timerAlertaAutomatico = DateTime.UtcNow;
                 await ExecutarVarreduraGeralAlertasAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
             }
         }
@@ -113,14 +113,15 @@ _ = Task.Run(async () =>
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
 
-// --- EXTRATORES AUXILIARES ---
+// --- EXTRATORES CORRIGIDOS ---
 static string ExtrairTelefone(JsonElement itemData, JsonElement keyElem)
 {
     string raw = "";
-    if (itemData.TryGetProperty("participant", out var p) && p.ValueKind == JsonValueKind.String)
-        raw = p.GetString() ?? "";
-    else if (keyElem.TryGetProperty("participant", out var kp) && kp.ValueKind == JsonValueKind.String)
+    // Prioriza o remetente individual em mensagens de grupos
+    if (keyElem.TryGetProperty("participant", out var kp) && kp.ValueKind == JsonValueKind.String)
         raw = kp.GetString() ?? "";
+    else if (itemData.TryGetProperty("participant", out var p) && p.ValueKind == JsonValueKind.String)
+        raw = p.GetString() ?? "";
     else if (keyElem.TryGetProperty("remoteJid", out var rj) && rj.ValueKind == JsonValueKind.String)
         raw = rj.GetString() ?? "";
 
@@ -128,29 +129,26 @@ static string ExtrairTelefone(JsonElement itemData, JsonElement keyElem)
     return raw.Split('@')[0].Split(':')[0];
 }
 
-static string ExtrairTextoRecursivo(JsonElement element)
+static string ExtrairTextoMensagem(JsonElement msgElem)
 {
-    if (element.ValueKind == JsonValueKind.String) return element.GetString() ?? "";
-    if (element.ValueKind == JsonValueKind.Object)
-    {
-        if (element.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(c.GetString()))
-            return c.GetString()!;
-        if (element.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(t.GetString()))
-            return t.GetString()!;
-        if (element.TryGetProperty("selectedButtonId", out var sb) && sb.ValueKind == JsonValueKind.String)
-            return sb.GetString()!;
+    if (msgElem.ValueKind != JsonValueKind.Object) return "";
 
-        foreach (var prop in element.EnumerateObject())
-        {
-            if (prop.NameEquals("key") || prop.NameEquals("messageTimestamp") || prop.NameEquals("status")) continue;
-            var res = ExtrairTextoRecursivo(prop.Value);
-            if (!string.IsNullOrWhiteSpace(res)) return res;
-        }
-    }
+    // Mensagem simples
+    if (msgElem.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String)
+        return c.GetString() ?? "";
+
+    // Mensagem estendida (com links ou formatação)
+    if (msgElem.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var extText))
+        return extText.GetString() ?? "";
+
+    // Legenda de imagem/mídia
+    if (msgElem.TryGetProperty("imageMessage", out var img) && img.TryGetProperty("caption", out var cap))
+        return cap.GetString() ?? "";
+
     return "";
 }
 
-// --- LÓGICA DE NEGÓCIO COM RESILIÊNCIA A CONFLITO NO GITHUB ---
+// --- LÓGICA DE NEGÓCIO ---
 static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string owner, string repo, string path, string token, string trecho, decimal precoTeto, string telefone)
 {
     for (int tentativa = 0; tentativa < 3; tentativa++)
@@ -163,7 +161,7 @@ static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string ow
         bool salvou = await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, $"Cadastrado {trecho}");
         
         if (salvou) return true;
-        await Task.Delay(500); // Aguarda e tenta novamente se houver conflito de SHA
+        await Task.Delay(500);
     }
     return false;
 }
@@ -228,12 +226,11 @@ static async Task ProcessarEEnviarAlertaVooAsync(HttpClient client, string apiUr
     if (partes.Length < 2) return;
 
     string orig = partes[0], dest = partes[1];
-    decimal precoEncontrado = 680.00m; // Mock para testes de envio
+    decimal precoEncontrado = 680.00m;
     DateTime dataVoo = DateTime.Now.AddDays(30);
 
     if (precoEncontrado <= voo.PrecoMaximo)
     {
-        // Link formatado para pesquisa direta de só ida no Google Flights
         string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+so+ida+de+{orig}+para+{dest}+em+{dataVoo:yyyy-MM-dd}";
         string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço Encontrado:* R$ {precoEncontrado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 *Confira e compre aqui:* {urlGoogle}";
 
@@ -241,7 +238,7 @@ static async Task ProcessarEEnviarAlertaVooAsync(HttpClient client, string apiUr
     }
 }
 
-// --- INTEGRAÇÃO GITHUB & EVOLUTION API ---
+// --- INTEGRAÇÃO EXTERNA ---
 static async Task<(List<VooConfig> Voos, string Sha)> ObterVoosDoGitHubAsync(HttpClient client, string owner, string repo, string path, string token)
 {
     var url = $"https://api.github.com/repos/{owner}/{repo}/contents/{path}";
