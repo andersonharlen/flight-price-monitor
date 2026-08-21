@@ -6,7 +6,7 @@ using System.Text.Json.Serialization;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-// Configurações
+// Configurações Globais
 var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN") ?? "SEU_GITHUB_TOKEN";
 var repoOwner = "andersonharlen";
 var repoName = "flight-price-monitor";
@@ -19,84 +19,194 @@ var instanceName = "voos";
 
 using var httpClient = new HttpClient();
 
-// --- 1. ROTA DO WEBHOOK (Recebe WhatsApp) ---
+// --- WEBHOOK: RECEBE E PROCESSA MENSAGENS DO WHATSAPP ---
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
-    
-    // Se receber o comando BUSCAR no WhatsApp, dispara a varredura na hora
-    if (body.Contains("BUSCAR", StringComparison.OrdinalIgnoreCase))
+
+    try
     {
-        _ = Task.Run(() => ExecutarVarreduraDePrecosAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey));
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        // Extrai dados da Evolution API
+        if (root.TryGetProperty("data", out var data))
+        {
+            var key = data.GetProperty("key");
+            bool fromMe = key.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
+            
+            // Ignora mensagens enviadas pelo próprio bot
+            if (fromMe) return Results.Ok(new { status = "ignored_self" });
+
+            string remoteJid = key.GetProperty("remoteJid").GetString() ?? "";
+            string telefone = remoteJid.Split('@')[0];
+
+            // Extrai o texto enviado
+            string textoMensagem = "";
+            if (data.TryGetProperty("message", out var msg))
+            {
+                if (msg.TryGetProperty("conversation", out var conv)) textoMensagem = conv.GetString() ?? "";
+                else if (msg.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var txt)) textoMensagem = txt.GetString() ?? "";
+            }
+
+            textoMensagem = textoMensagem.Trim();
+            Console.WriteLine($"[WHATSAPP RECEBIDO] De: {telefone} | Texto: '{textoMensagem}'");
+
+            // 1. Comando CADASTRAR (ex: CADASTRAR MGF-AJU 800)
+            if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
+            {
+                var partes = textoMensagem.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (partes.Length >= 3 && decimal.TryParse(partes[2], out decimal precoTeto))
+                {
+                    string trecho = partes[1].ToUpper();
+                    await CadastrarVooNoGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
+                    Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado no GitHub para {telefone}");
+                }
+            }
+            // 2. Comando BUSCAR
+            else if (textoMensagem.Equals("BUSCAR", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = Task.Run(() => ExecutarVarreduraDePrecosAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey, telefone));
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
     }
 
-    return Results.Ok(new { status = "success" });
+    return Results.Ok(new { status = "processed" });
 });
 
-// --- 2. WORKER EM SEGUNDO PLANO (Agendamento Automático + Fila GitHub) ---
+// --- WORKER LOCAL EM SEGUNDO PLANO ---
 _ = Task.Run(async () =>
 {
-    // Timer para rodar a busca automática a cada 1 hora (ajuste como preferir)
-    var timerBusca = new PeriodicTimer(TimeSpan.FromHours(1));
-
     while (true)
     {
         try
         {
-            // Processa confirmações de cadastro pendentes no GitHub
             await ProcessarPendenciasGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERRO WORKER]: {ex.Message}");
         }
-
-        await Task.Delay(TimeSpan.FromSeconds(30));
+        await Task.Delay(TimeSpan.FromSeconds(20));
     }
 });
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
 
-// --- MÉTODO DE VARREDURA E ENVIO DE LINKS ---
-static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey)
+// --- LÓGICA DE CADASTRO E ENVIO ---
+static async Task CadastrarVooNoGitHubAsync(HttpClient client, string owner, string repo, string path, string token, string trecho, decimal precoTeto, string telefone)
 {
-    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 🔍 Executando varredura de preços...");
+    var (voos, sha) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
+    voos.Add(new VooConfig(trecho, precoTeto, telefone, true));
 
-    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
+    await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, $"Cadastrado {trecho}");
+}
 
-    foreach (var voo in voos)
+static async Task ProcessarPendenciasGitHubAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey)
+{
+    var (voos, sha) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    bool alterou = false;
+
+    for (int i = 0; i < voos.Count; i++)
     {
-        // 1. AQUI ENTRA A SUA CONSULTA NA API DE VOOS OU SCRAPER
-        // Exemplo simulado de resultado encontrado:
-        string[] partes = voo.Trecho.Split('-');
-        string origem = partes[0];
-        string destino = partes[1];
-        decimal precoEncontrado = 680.00m; // Exemplo de preço vindo da API
-        DateTime dataVoo = DateTime.Now.AddDays(30);
-
-        // 2. Se o preço for menor ou igual ao teto cadastrado, envia o alerta com LINK
-        if (precoEncontrado <= voo.PrecoMaximo)
+        if (voos[i].PendenteEnvio)
         {
-            string urlGoogleFlights = $"https://www.google.com/travel/flights?q=Voos+de+{origem}+para+{destino}+em+{dataVoo:yyyy-MM-dd}";
-
-            string mensagem = $"""
-            🚨 *OFERTA DE PASSAGEM ENCONTRADA!* 🚨
-
-            ✈️ *Trecho:* {origem} ➔ {destino}
-            📅 *Data:* {dataVoo:dd/MM/yyyy}
-
-            💰 *Preço Encontrado:* R$ {precoEncontrado:N2}
-            🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}
-
-            🔗 *Clique para ver e comprar:*
-            {urlGoogleFlights}
-            """;
-
-            await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, mensagem);
+            var voo = voos[i];
+            string msg = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ *Trecho:* {voo.Trecho}\n💰 *Preço Teto:* R$ {voo.PrecoMaximo}\n\nVocê receberá atualizações assim que encontrarmos passagens abaixo deste valor.";
+            
+            bool enviado = await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, msg);
+            if (enviado)
+            {
+                voos[i] = voo with { PendenteEnvio = false };
+                alterou = true;
+            }
         }
+    }
+
+    if (alterou)
+    {
+        var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
+        await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, "Pendencias confirmadas");
     }
 }
 
-// Métodos auxiliares de integração com GitHub e Evolution API mantidos abaixo...
+static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey, string telefoneDestino)
+{
+    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    var meusVoos = voos.Where(v => v.Telefone == telefoneDestino).ToList();
+
+    if (!meusVoos.Any())
+    {
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "⚠️ Você não possui alertas cadastrados no momento.");
+        return;
+    }
+
+    foreach (var voo in meusVoos)
+    {
+        var partes = voo.Trecho.Split('-');
+        string orig = partes[0], dest = partes[1];
+        decimal precoSimulado = 680.00m; // Exemplo de busca da API
+        DateTime dataVoo = DateTime.Now.AddDays(30);
+
+        string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+de+{orig}+para+{dest}+em+{dataVoo:yyyy-MM-dd}";
+        string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço Encontrado:* R$ {precoSimulado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 *Confira aqui:* {urlGoogle}";
+
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, msg);
+    }
+}
+
+static async Task<(List<VooConfig> Voos, string Sha)> ObterVoosDoGitHubAsync(HttpClient client, string owner, string repo, string path, string token)
+{
+    var url = $"https://api.github.com/repos/{owner}/{repo}/contents/{path}";
+    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+    req.Headers.UserAgent.Add(new ProductInfoHeaderValue("FlightMonitor", "1.0"));
+    if (!string.IsNullOrEmpty(token)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    var res = await client.SendAsync(req);
+    if (!res.IsSuccessStatusCode) return (new List<VooConfig>(), "");
+
+    var body = await res.Content.ReadAsStringAsync();
+    using var doc = JsonDocument.Parse(body);
+    var sha = doc.RootElement.GetProperty("sha").GetString() ?? "";
+    var contentBase64 = doc.RootElement.GetProperty("content").GetString() ?? "";
+    var jsonText = Encoding.UTF8.GetString(Convert.FromBase64String(contentBase64.Replace("\n", "")));
+
+    return (JsonSerializer.Deserialize<List<VooConfig>>(jsonText) ?? new(), sha);
+}
+
+static async Task SalvarVoosNoGitHubAsync(HttpClient client, string owner, string repo, string path, string token, string json, string sha, string msg)
+{
+    var url = $"https://api.github.com/repos/{owner}/{repo}/contents/{path}";
+    using var req = new HttpRequestMessage(HttpMethod.Put, url);
+    req.Headers.UserAgent.Add(new ProductInfoHeaderValue("FlightMonitor", "1.0"));
+    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    var payload = new { message = msg, content = Convert.ToBase64String(Encoding.UTF8.GetBytes(json)), sha = sha };
+    req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    await client.SendAsync(req);
+}
+
+static async Task<bool> EnviarWhatsAppAsync(HttpClient client, string baseUrl, string instance, string apiKey, string telefone, string mensagem)
+{
+    try
+    {
+        var url = $"{baseUrl.TrimEnd('/')}/message/sendText/{instance}";
+        using var req = new HttpRequestMessage(HttpMethod.Post, url);
+        req.Headers.Add("apikey", apiKey);
+        req.Content = new StringContent(JsonSerializer.Serialize(new { number = telefone, text = mensagem }), Encoding.UTF8, "application/json");
+        
+        var res = await client.SendAsync(req);
+        return res.IsSuccessStatusCode;
+    }
+    catch { return false; }
+}
+
+public record VooConfig([property: JsonPropertyName("Trecho")] string Trecho, [property: JsonPropertyName("PrecoMaximo")] decimal PrecoMaximo, [property: JsonPropertyName("Telefone")] string Telefone, [property: JsonPropertyName("PendenteEnvio")] bool PendenteEnvio);
