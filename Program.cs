@@ -10,6 +10,14 @@ var arquivoVoos = "voos.json";
 
 app.MapGet("/", () => "API de Monitoramento de Voos Rodando!");
 
+app.MapGet("/voos", async () =>
+{
+    if (!File.Exists(arquivoVoos)) return Results.Ok(new List<VooConfig>());
+    var json = await File.ReadAllTextAsync(arquivoVoos);
+    var voos = JsonSerializer.Deserialize<List<VooConfig>>(json) ?? new();
+    return Results.Ok(voos);
+});
+
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     try
@@ -44,7 +52,10 @@ app.MapPost("/webhook", async (HttpContext context) =>
                             voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
                         }
 
-                        voos.Add(new VooConfig(trecho, precoMaximo, telefone));
+                        // Remove duplicado do mesmo telefone/trecho se já existir, ou adiciona novo
+                        voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
+                        voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
+
                         await File.WriteAllTextAsync(arquivoVoos, JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true }));
 
                         Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}");
@@ -67,5 +78,6 @@ app.Run();
 record VooConfig(
     [property: JsonPropertyName("Trecho")] string Trecho, 
     [property: JsonPropertyName("PrecoMaximo")] decimal PrecoMaximo, 
-    [property: JsonPropertyName("Telefone")] string Telefone
+    [property: JsonPropertyName("Telefone")] string Telefone,
+    [property: JsonPropertyName("PendenteEnvio")] bool PendenteEnvio
 );
