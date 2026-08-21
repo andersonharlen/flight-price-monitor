@@ -30,24 +30,38 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        // Extrai dados da Evolution API
-        if (root.TryGetProperty("data", out var data))
+        // Trata a variação da Evolution API (data como Array ou Objeto)
+        JsonElement itemData = root;
+
+        if (root.TryGetProperty("data", out var dataElem))
         {
-            var key = data.GetProperty("key");
-            bool fromMe = key.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
-            
-            // Ignora mensagens enviadas pelo próprio bot
+            if (dataElem.ValueKind == JsonValueKind.Array && dataElem.GetArrayLength() > 0)
+            {
+                itemData = dataElem[0];
+            }
+            else if (dataElem.ValueKind == JsonValueKind.Object)
+            {
+                itemData = dataElem;
+            }
+        }
+
+        // Garante que o elemento possui a chave 'key'
+        if (itemData.ValueKind == JsonValueKind.Object && itemData.TryGetProperty("key", out var keyElem) && keyElem.ValueKind == JsonValueKind.Object)
+        {
+            bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
             if (fromMe) return Results.Ok(new { status = "ignored_self" });
 
-            string remoteJid = key.GetProperty("remoteJid").GetString() ?? "";
+            string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? (rj.GetString() ?? "") : "";
             string telefone = remoteJid.Split('@')[0];
 
-            // Extrai o texto enviado
+            // Extrai o texto da mensagem com segurança
             string textoMensagem = "";
-            if (data.TryGetProperty("message", out var msg))
+            if (itemData.TryGetProperty("message", out var msgElem) && msgElem.ValueKind == JsonValueKind.Object)
             {
-                if (msg.TryGetProperty("conversation", out var conv)) textoMensagem = conv.GetString() ?? "";
-                else if (msg.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var txt)) textoMensagem = txt.GetString() ?? "";
+                if (msgElem.TryGetProperty("conversation", out var conv)) 
+                    textoMensagem = conv.GetString() ?? "";
+                else if (msgElem.TryGetProperty("extendedTextMessage", out var ext) && ext.ValueKind == JsonValueKind.Object && ext.TryGetProperty("text", out var txt)) 
+                    textoMensagem = txt.GetString() ?? "";
             }
 
             textoMensagem = textoMensagem.Trim();
@@ -153,7 +167,7 @@ static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner
     {
         var partes = voo.Trecho.Split('-');
         string orig = partes[0], dest = partes[1];
-        decimal precoSimulado = 680.00m; // Exemplo de busca da API
+        decimal precoSimulado = 680.00m;
         DateTime dataVoo = DateTime.Now.AddDays(30);
 
         string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+de+{orig}+para+{dest}+em+{dataVoo:yyyy-MM-dd}";
