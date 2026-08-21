@@ -27,31 +27,37 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var reader = new StreamReader(context.Request.Body);
         var body = await reader.ReadToEndAsync();
         
-        // Imprime o JSON bruto nos logs da Render para sabermos exatamente o que chegou
-        Console.WriteLine($"[WEBHOOK RECEBIDO]: {body}");
-
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        // Tenta capturar a mensagem independentemente da estrutura exata
         string textoMensagem = "";
         string remetente = "";
 
-        if (root.TryGetProperty("data", out var data))
+        // Verifica se o evento é de mensagem recebida (messages.upsert)
+        if (root.TryGetProperty("event", out var eventProp) && eventProp.GetString() == "messages.upsert")
         {
-            if (data.TryGetProperty("message", out var msg) && msg.TryGetProperty("conversation", out var textProp))
+            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
             {
-                textoMensagem = textProp.GetString()?.Trim() ?? "";
-            }
-            // Fallback para outras estruturas comuns da Evolution API
-            else if (data.TryGetProperty("body", out var bodyProp))
-            {
-                textoMensagem = bodyProp.GetString()?.Trim() ?? "";
-            }
+                if (data.TryGetProperty("key", out var keyProp))
+                {
+                    if (keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
+                    {
+                        remetente = remoteJidProp.GetString() ?? "";
+                    }
+                }
 
-            if (data.TryGetProperty("key", out var keyProp) && keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
-            {
-                remetente = remoteJidProp.GetString() ?? "";
+                if (data.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object)
+                {
+                    if (msg.TryGetProperty("conversation", out var convProp))
+                    {
+                        textoMensagem = convProp.GetString()?.Trim() ?? "";
+                    }
+                    else if (msg.TryGetProperty("extendedTextMessage", out var extProp) && 
+                             extProp.TryGetProperty("text", out var textProp))
+                    {
+                        textoMensagem = textProp.GetString()?.Trim() ?? "";
+                    }
+                }
             }
         }
 
@@ -89,7 +95,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
+        Console.WriteLine($"[ERRO WEBHOOK SILENCIADO]: {ex.Message}");
         return Results.Ok(new { status = "erro_ignorado" });
     }
 });
