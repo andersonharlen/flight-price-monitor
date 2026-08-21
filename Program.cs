@@ -3,187 +3,179 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-var builder = WebApplication.CreateBuilder(args);
-var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
-builder.WebHost.UseUrls($"http://*:{port}");
-var app = builder.Build();
+// Configurações do GitHub e Evolution API Local
+var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN") ?? "SEU_GITHUB_TOKEN_AQUI";
+var repoOwner = "andersonharlen";
+var repoName = "flight-price-monitor";
+var path = "voos.json";
 
-var arquivoVoos = "voos.json";
+var evolutionApiUrl = "http://localhost:8080";
+var evolutionApiKey = "B2AC8C01-9A1F-4EE0-9D38-C65B3938EC9A";
+var instanceName = "voos";
 
-app.MapGet("/", () => "API de Monitoramento de Voos Rodando!");
+Console.WriteLine("🚀 Worker Local de Monitoramento e Notificações Iniciado!");
 
-app.MapGet("/voos", async () =>
-{
-    if (!File.Exists(arquivoVoos)) return Results.Ok(new List<VooConfig>());
-    var json = await File.ReadAllTextAsync(arquivoVoos);
-    var voos = JsonSerializer.Deserialize<List<VooConfig>>(json) ?? new();
-    return Results.Ok(voos);
-});
+using var httpClient = new HttpClient();
 
-app.MapPost("/webhook", async (HttpContext context) =>
+while (true)
 {
     try
     {
-        using var reader = new StreamReader(context.Request.Body);
-        var body = await reader.ReadToEndAsync();
-        
-        using var doc = JsonDocument.Parse(body);
-        var root = doc.RootElement;
+        Console.WriteLine($"\n[{DateTime.Now:HH:mm:ss}] Verificando pendências no GitHub...");
 
-        string textoMensagem = "";
-        string remoteJid = "";
+        var (voos, sha) = await ObterVoosDoGitHubAsync(httpClient, repoOwner, repoName, path, githubToken);
 
-        if (root.TryGetProperty("event", out var eventProp) && eventProp.GetString() == "messages.upsert")
+        bool houveAlteracao = false;
+
+        if (voos.Count > 0)
         {
-            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
+            for (int i = 0; i < voos.Count; i++)
             {
-                if (data.TryGetProperty("key", out var keyProp))
+                var voo = voos[i];
+
+                // 1. Processa Confirmação de Cadastro Pendente
+                if (voo.PendenteEnvio)
                 {
-                    if (keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
+                    Console.WriteLine($"[PENDÊNCIA DETECTADA] Enviando confirmação de cadastro para {voo.Telefone} ({voo.Trecho})...");
+
+                    var mensagem = $"✅ *Alerta Cadastrado com Sucesso!*\n\n" +
+                                   $"✈️ *Trecho:* {voo.Trecho}\n" +
+                                   $"💰 *Preço Teto:* R$ {voo.PrecoMaximo}\n\n" +
+                                   $"Você receberá notificações sempre que encontrarmos passagens abaixo deste valor.";
+
+                    bool enviado = await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, voo.Telefone, mensagem);
+
+                    if (enviado)
                     {
-                        remoteJid = remoteJidProp.GetString() ?? "";
+                        // Marca pendência como resolvida
+                        voos[i] = voo with { PendenteEnvio = false };
+                        houveAlteracao = true;
                     }
                 }
 
-                if (data.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object)
-                {
-                    if (msg.TryGetProperty("conversation", out var convProp))
-                    {
-                        textoMensagem = convProp.GetString()?.Trim() ?? "";
-                    }
-                    else if (msg.TryGetProperty("extendedTextMessage", out var extProp) && 
-                             extProp.TryGetProperty("text", out var textProp))
-                    {
-                        textoMensagem = textProp.GetString()?.Trim() ?? "";
-                    }
-                }
+                // 2. [AQUI ENTRA O SCRAPER / API DE VOOS]
+                // decimal precoEncontrado = await ConsultarPrecoVooAsync(voo.Trecho);
+                // if (precoEncontrado > 0 && precoEncontrado <= voo.PrecoMaximo) {
+                //     await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, voo.Telefone, $"🚨 *OFERTA!* Voo {voo.Trecho} por R$ {precoEncontrado}");
+                // }
+            }
+
+            // Se alterou algum status de PendenteEnvio, salva a atualização no GitHub
+            if (houveAlteracao)
+            {
+                var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
+                await SalvarVoosNoGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, novoJson, sha);
+                Console.WriteLine("✅ GitHub atualizado: Pendência marcada como concluída.");
             }
         }
-
-        if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
+        else
         {
-            var partes = textoMensagem.Split(' ');
-            if (partes.Length >= 3)
-            {
-                var trecho = partes[1].ToUpper();
-                if (decimal.TryParse(partes[2], out var precoMaximo))
-                {
-                    var telefone = remoteJid.Contains("@") ? remoteJid.Split('@')[0] : "55whatsapp";
-
-                    List<VooConfig> voos = new();
-                    if (File.Exists(arquivoVoos))
-                    {
-                        var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
-                        voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
-                    }
-
-                    voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
-                    voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
-
-                    var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
-                    await File.WriteAllTextAsync(arquivoVoos, novoJson);
-
-                    // 1. Salva no GitHub
-                    await SalvarVoosNoGitHubAsync(novoJson);
-
-                    // 2. Envia a confirmação de volta no WhatsApp
-                    if (!string.IsNullOrEmpty(remoteJid))
-                    {
-                        var respostaTexto = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ Trecho: {trecho}\n💰 Preço Teto: R$ {precoMaximo}";
-                        await EnviarMensagemWhatsAppAsync(remoteJid, respostaTexto);
-                    }
-
-                    Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}!");
-                }
-            }
+            Console.WriteLine("Nenhum voo cadastrado no arquivo.");
         }
-
-        return Results.Ok(new { status = "processado" });
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO WEBHOOK SILENCIADO]: {ex.Message}");
-        return Results.Ok(new { status = "erro_ignorado" });
+        Console.WriteLine($"[ERRO NO WORKER]: {ex.Message}");
     }
-});
 
-app.Run();
+    // Intervalo entre verificações (30 segundos)
+    await Task.Delay(TimeSpan.FromSeconds(30));
+}
 
-async Task SalvarVoosNoGitHubAsync(string conteudoJson)
+// --- MÉTODOS DE INTEGRAÇÃO ---
+
+static async Task<(List<VooConfig> Voos, string Sha)> ObterVoosDoGitHubAsync(
+    HttpClient client, string owner, string repo, string path, string token)
 {
-    var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-    if (string.IsNullOrEmpty(token)) return;
+    var url = $"https://api.github.com/repos/{owner}/{repo}/contents/{path}";
+    
+    using var request = new HttpRequestMessage(HttpMethod.Get, url);
+    request.Headers.UserAgent.Add(new ProductInfoHeaderValue("FlightPriceWorker", "1.0"));
+    if (!string.IsNullOrEmpty(token))
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-    using var client = new HttpClient();
-    client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("FlightPriceMonitor", "1.0"));
-    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+    var response = await client.SendAsync(request);
+    if (!response.IsSuccessStatusCode) return (new List<VooConfig>(), "");
 
-    var repoOwner = "andersonharlen";
-    var repoName = "flight-price-monitor";
-    var path = "voos.json";
-    var url = $"https://api.github.com/repos/{repoOwner}/{repoName}/contents/{path}";
+    var body = await response.Content.ReadAsStringAsync();
+    using var doc = JsonDocument.Parse(body);
+    var root = doc.RootElement;
 
-    string? sha = null;
-    var getResponse = await client.GetAsync(url);
-    if (getResponse.IsSuccessStatusCode)
-    {
-        var getBody = await getResponse.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(getBody);
-        if (doc.RootElement.TryGetProperty("sha", out var shaProp))
-        {
-            sha = shaProp.GetString();
-        }
-    }
+    var sha = root.GetProperty("sha").GetString() ?? "";
+    var contentBase64 = root.GetProperty("content").GetString() ?? "";
+    
+    var jsonText = Encoding.UTF8.GetString(Convert.FromBase64String(contentBase64.Replace("\n", "")));
+    var voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonText) ?? new();
+
+    return (voos, sha);
+}
+
+static async Task SalvarVoosNoGitHubAsync(
+    HttpClient client, string owner, string repo, string path, string token, string conteudoJson, string sha)
+{
+    var url = $"https://api.github.com/repos/{owner}/{repo}/contents/{path}";
+
+    using var request = new HttpRequestMessage(HttpMethod.Put, url);
+    request.Headers.UserAgent.Add(new ProductInfoHeaderValue("FlightPriceWorker", "1.0"));
+    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
     var bytes = Encoding.UTF8.GetBytes(conteudoJson);
     var base64Content = Convert.ToBase64String(bytes);
 
     var payload = new Dictionary<string, object>
     {
-        { "message", "Atualização automática de voos via bot [skip ci]" },
+        { "message", "Worker Local: Atualizado PendenteEnvio para false [skip ci]" },
         { "content", base64Content },
-        { "branch", "main" }
+        { "sha", sha }
     };
 
-    if (!string.IsNullOrEmpty(sha))
-    {
-        payload.Add("sha", sha);
-    }
+    request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    var response = await client.SendAsync(request);
 
-    var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-    await client.PutAsync(url, content);
+    if (!response.IsSuccessStatusCode)
+    {
+        var err = await response.Content.ReadAsStringAsync();
+        Console.WriteLine($"[ERRO AO SALVAR NO GITHUB]: {err}");
+    }
 }
 
-async Task EnviarMensagemWhatsAppAsync(string remoteJid, string mensagem)
+static async Task<bool> EnviarWhatsAppAsync(
+    HttpClient client, string baseUrl, string instance, string apiKey, string telefone, string mensagem)
 {
     try
     {
-        // Pegando as configs de ambiente da Render (ou valores padrão)
-        var evolutionApiUrl = Environment.GetEnvironmentVariable("EVOLUTION_API_URL") ?? "http://localhost:8080";
-        var evolutionApiKey = Environment.GetEnvironmentVariable("EVOLUTION_API_KEY") ?? "B2AC8C01-9A1F-4EE0-9D38-C65B3938EC9A";
-        var instanceName = "voos";
+        var url = $"{baseUrl.TrimEnd('/')}/message/sendText/{instance}";
 
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.Add("apikey", evolutionApiKey);
-
-        var url = $"{evolutionApiUrl}/message/sendText/{instanceName}";
+        using var request = new HttpRequestMessage(HttpMethod.Post, url);
+        request.Headers.Add("apikey", apiKey);
 
         var payload = new
         {
-            number = remoteJid,
+            number = telefone,
             text = mensagem
         };
 
-        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-        await client.PostAsync(url, content);
+        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        var response = await client.SendAsync(request);
+
+        if (response.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"[WHATSAPP ENVIADO SUCESSO]: Mensagem entregue para {telefone}");
+            return true;
+        }
+
+        var err = await response.Content.ReadAsStringAsync();
+        Console.WriteLine($"[ERRO EVOLUTION API]: HTTP {response.StatusCode} - {err}");
+        return false;
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO AO ENVIAR WHATSAPP]: {ex.Message}");
+        Console.WriteLine($"[FALHA DE CONEXÃO EVOLUTION API LOCAL]: {ex.Message}");
+        return false;
     }
 }
 
-record VooConfig(
+public record VooConfig(
     [property: JsonPropertyName("Trecho")] string Trecho, 
     [property: JsonPropertyName("PrecoMaximo")] decimal PrecoMaximo, 
     [property: JsonPropertyName("Telefone")] string Telefone,
