@@ -1,12 +1,13 @@
+# Usa a imagem oficial do .NET 8 para compilar
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
-COPY *.csproj ./
-RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /app/publish
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+# Usa a imagem leve para rodar a aplicação
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
-EXPOSE 8080
 COPY --from=build /app/publish .
-ENTRYPOINT ["dotnet", "FlightMonitor.dll"]
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "flight-price-monitor.dll"]
