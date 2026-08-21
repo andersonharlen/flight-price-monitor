@@ -28,37 +28,42 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        if (root.TryGetProperty("data", out var data) && 
-            data.TryGetProperty("message", out var msg) && 
+        // Valida se o JSON possui a estrutura de dados de mensagem esperada
+        if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object &&
+            data.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object &&
             msg.TryGetProperty("conversation", out var textProp))
         {
             var textoMensagem = textProp.GetString()?.Trim() ?? "";
-            var remetente = data.GetProperty("key").GetProperty("remoteJid").GetString() ?? "";
-
-            if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
+            
+            if (data.TryGetProperty("key", out var keyProp) && 
+                keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
             {
-                var partes = textoMensagem.Split(' ');
-                if (partes.Length >= 3)
+                var remetente = remoteJidProp.GetString() ?? "";
+
+                if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
                 {
-                    var trecho = partes[1].ToUpper();
-                    if (decimal.TryParse(partes[2], out var precoMaximo))
+                    var partes = textoMensagem.Split(' ');
+                    if (partes.Length >= 3)
                     {
-                        var telefone = remetente.Split('@')[0];
-
-                        List<VooConfig> voos = new();
-                        if (File.Exists(arquivoVoos))
+                        var trecho = partes[1].ToUpper();
+                        if (decimal.TryParse(partes[2], out var precoMaximo))
                         {
-                            var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
-                            voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
+                            var telefone = remetente.Split('@')[0];
+
+                            List<VooConfig> voos = new();
+                            if (File.Exists(arquivoVoos))
+                            {
+                                var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
+                                voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
+                            }
+
+                            voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
+                            voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
+
+                            await File.WriteAllTextAsync(arquivoVoos, JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true }));
+
+                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}");
                         }
-
-                        // Remove duplicado do mesmo telefone/trecho se já existir, ou adiciona novo
-                        voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
-                        voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
-
-                        await File.WriteAllTextAsync(arquivoVoos, JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true }));
-
-                        Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}");
                     }
                 }
             }
@@ -68,8 +73,8 @@ app.MapPost("/webhook", async (HttpContext context) =>
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
-        return Results.BadRequest(new { erro = ex.Message });
+        Console.WriteLine($"[ERRO WEBHOOK SILENCIADO]: {ex.Message}");
+        return Results.Ok(new { status = "ignorado" }); // Retorna 200 para a Evolution não ficar re-enviando eventos de sistema
     }
 });
 
