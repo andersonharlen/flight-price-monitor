@@ -9,8 +9,7 @@ var repoOwner = "andersonharlen";
 var repoName = "flight-price-monitor";
 var path = "voos.json";
 
-var evolutionApiUrl = Environment.GetEnvironmentVariable("EVOLUTION_API_URL") 
-                      ?? "https://aggregate-tricks-soup-foundation.trycloudflare.com";
+var evolutionApiUrl = "https://aggregate-tricks-soup-foundation.trycloudflare.com";
 var evolutionApiKey = "B2AC8C01-9A1F-4EE0-9D38-C65B3938EC9A";
 var instanceName = "voos";
 
