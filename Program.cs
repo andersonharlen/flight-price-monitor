@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -28,7 +30,6 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        // Valida se o JSON possui a estrutura de dados de mensagem esperada
         if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object &&
             data.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object &&
             msg.TryGetProperty("conversation", out var textProp))
@@ -60,9 +61,13 @@ app.MapPost("/webhook", async (HttpContext context) =>
                             voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
                             voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
 
-                            await File.WriteAllTextAsync(arquivoVoos, JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true }));
+                            var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
+                            await File.WriteAllTextAsync(arquivoVoos, novoJson);
 
-                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}");
+                            // Salva automaticamente no GitHub para persistir no repositório
+                            await SalvarVoosNoGitHubAsync(novoJson);
+
+                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo} e salvo no GitHub!");
                         }
                     }
                 }
@@ -74,11 +79,56 @@ app.MapPost("/webhook", async (HttpContext context) =>
     catch (Exception ex)
     {
         Console.WriteLine($"[ERRO WEBHOOK SILENCIADO]: {ex.Message}");
-        return Results.Ok(new { status = "ignorado" }); // Retorna 200 para a Evolution não ficar re-enviando eventos de sistema
+        return Results.Ok(new { status = "ignorado" });
     }
 });
 
 app.Run();
+
+async Task SalvarVoosNoGitHubAsync(string conteudoJson)
+{
+    var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+    if (string.IsNullOrEmpty(token)) return;
+
+    using var client = new HttpClient();
+    client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("FlightPriceMonitor", "1.0"));
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    var repoOwner = "andersonharlen";
+    var repoName = "flight-price-monitor";
+    var path = "voos.json";
+    var url = $"https://api.github.com/repos/{repoOwner}/{repoName}/contents/{path}";
+
+    string? sha = null;
+    var getResponse = await client.GetAsync(url);
+    if (getResponse.IsSuccessStatusCode)
+    {
+        var getBody = await getResponse.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(getBody);
+        if (doc.RootElement.TryGetProperty("sha", out var shaProp))
+        {
+            sha = shaProp.GetString();
+        }
+    }
+
+    var bytes = Encoding.UTF8.GetBytes(conteudoJson);
+    var base64Content = Convert.ToBase64String(bytes);
+
+    var payload = new Dictionary<string, object>
+    {
+        { "message", "Atualização automática de voos via bot [skip ci]" },
+        { "content", base64Content },
+        { "branch", "main" }
+    };
+
+    if (!string.IsNullOrEmpty(sha))
+    {
+        payload.Add("sha", sha);
+    }
+
+    var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    await client.PutAsync(url, content);
+}
 
 record VooConfig(
     [property: JsonPropertyName("Trecho")] string Trecho, 
