@@ -19,11 +19,13 @@ var instanceName = "voos";
 
 using var httpClient = new HttpClient();
 
-// --- 1. WEBHOOK (RESPOSTA IMEDIATA) ---
+// --- 1. WEBHOOK (COM LOGS DE DIAGNÓSTICO PASSO A PASSO) ---
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
+
+    if (string.IsNullOrWhiteSpace(body)) return Results.Ok(new { status = "empty_body" });
 
     try
     {
@@ -41,67 +43,90 @@ app.MapPost("/webhook", async (HttpContext context) =>
 
         if (itemData.ValueKind == JsonValueKind.Object && itemData.TryGetProperty("key", out var keyElem))
         {
+            // Ignora mensagens enviadas pelo próprio número
             bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
-            if (fromMe) return Results.Ok(new { status = "ignored_self" });
+            if (fromMe) 
+            {
+                Console.WriteLine("[WEBHOOK] Ignorado: enviada por mim (fromMe).");
+                return Results.Ok(new { status = "ignored_self" });
+            }
 
-            // Filtra mensagens de grupo
+            // Filtro de Grupo (@g.us)
             string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? rj.GetString() ?? "" : "";
             if (remoteJid.EndsWith("@g.us")) 
+            {
+                Console.WriteLine($"[WEBHOOK] Ignorado: mensagem de grupo ({remoteJid}).");
                 return Results.Ok(new { status = "ignored_group" });
+            }
 
             string telefone = remoteJid.Split('@')[0].Split(':')[0];
-            if (string.IsNullOrEmpty(telefone)) return Results.Ok(new { status = "no_phone" });
+            if (string.IsNullOrEmpty(telefone)) 
+            {
+                Console.WriteLine("[WEBHOOK] Ignorado: número de telefone não identificado.");
+                return Results.Ok(new { status = "no_phone" });
+            }
 
+            // Extrai o texto da mensagem tratando estruturas simples e complexas
             string textoMensagem = "";
             if (itemData.TryGetProperty("message", out var msgElem))
             {
-                textoMensagem = ExtrairTextoMensagem(msgElem);
+                textoMensagem = ExtrairTextoRobusto(msgElem);
             }
 
             textoMensagem = textoMensagem.Trim();
-            if (string.IsNullOrEmpty(textoMensagem)) return Results.Ok(new { status = "ignored_non_text" });
+            Console.WriteLine($"[WHATSAPP RECEBIDO] De: {telefone} | Texto: '{textoMensagem}'");
 
-            Console.WriteLine($"[WHATSAPP DIRETO] De: {telefone} | Texto: '{textoMensagem}'");
+            if (string.IsNullOrEmpty(textoMensagem)) 
+            {
+                Console.WriteLine("[WEBHOOK] Ignorado: texto extraído está vazio.");
+                return Results.Ok(new { status = "ignored_empty_text" });
+            }
 
-            // Comando CADASTRAR
+            // COMANDO: CADASTRAR
             if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
             {
                 var partes = textoMensagem.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                 if (partes.Length >= 3 && decimal.TryParse(partes[2], out decimal precoTeto))
                 {
                     string trecho = partes[1].ToUpper();
-                    
+                    Console.WriteLine($"[AÇÃO] Tentando cadastrar {trecho} com teto R$ {precoTeto} para {telefone}...");
+
                     bool ok = await SalvarCadastroComRetryAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
                     
                     if (ok)
                     {
-                        Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado no GitHub para {telefone}");
+                        Console.WriteLine($"[SUCESSO] Salvo no GitHub. Enviando confirmação WhatsApp...");
                         string msgConfirmacao = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ *Trecho:* {trecho}\n💰 *Preço Teto:* R$ {precoTeto:N2}\n\nVocê receberá atualizações automáticas assim que encontrarmos passagens abaixo deste valor.";
                         await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, msgConfirmacao);
                     }
                     else
                     {
-                        Console.WriteLine($"[ERRO] Falha ao cadastrar no GitHub para {telefone}");
-                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "❌ Não foi possível salvar seu alerta. Tente novamente em alguns instantes.");
+                        Console.WriteLine($"[ERRO] Falha ao atualizar o JSON no GitHub.");
+                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "❌ Falha ao salvar no banco de dados. Tente novamente em instantes.");
                     }
                 }
+                else
+                {
+                    await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "⚠️ Formato incorreto. Use: *CADASTRAR MGF-AJU 900*");
+                }
             }
-            // Comando BUSCAR
+            // COMANDO: BUSCAR
             else if (textoMensagem.Equals("BUSCAR", StringComparison.OrdinalIgnoreCase))
             {
+                Console.WriteLine($"[AÇÃO] Executando busca para {telefone}...");
                 _ = Task.Run(() => ExecutarVarreduraDePrecosAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey, telefone));
             }
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
+        Console.WriteLine($"[ERRO CRÍTICO NO WEBHOOK]: {ex.Message}");
     }
 
     return Results.Ok(new { status = "processed" });
 });
 
-// --- 2. WORKER EM SEGUNDO PLANO (APENAS VARREDURA HORA EM HORA) ---
+// --- 2. WORKER (VARREDURA PERIÓDICA A CADA 1 HORA) ---
 _ = Task.Run(async () =>
 {
     while (true)
@@ -121,27 +146,33 @@ _ = Task.Run(async () =>
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
 
-// --- EXTRATORES ---
-static string ExtrairTextoMensagem(JsonElement msgElem)
+// --- EXTRATOR DE TEXTO RESISTENTE A MUDANÇAS DA API ---
+static string ExtrairTextoRobusto(JsonElement element)
 {
-    if (msgElem.ValueKind != JsonValueKind.Object) return "";
+    if (element.ValueKind == JsonValueKind.String) return element.GetString() ?? "";
+    if (element.ValueKind == JsonValueKind.Object)
+    {
+        if (element.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String)
+            return c.GetString() ?? "";
+        if (element.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
+            return t.GetString() ?? "";
 
-    if (msgElem.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String)
-        return c.GetString() ?? "";
+        foreach (var prop in element.EnumerateObject())
+        {
+            if (prop.NameEquals("key") || prop.NameEquals("messageTimestamp") || prop.NameEquals("status") || prop.NameEquals("contextInfo")) 
+                continue;
 
-    if (msgElem.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var extText))
-        return extText.GetString() ?? "";
-
-    if (msgElem.TryGetProperty("imageMessage", out var img) && img.TryGetProperty("caption", out var cap))
-        return cap.GetString() ?? "";
-
+            var res = ExtrairTextoRobusto(prop.Value);
+            if (!string.IsNullOrWhiteSpace(res)) return res;
+        }
+    }
     return "";
 }
 
 // --- LÓGICA DE NEGÓCIO ---
 static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string owner, string repo, string path, string token, string trecho, decimal precoTeto, string telefone)
 {
-    for (int tentativa = 0; tentativa < 3; tentativa++)
+    for (int tentativa = 1; tentativa <= 3; tentativa++)
     {
         var (voos, sha) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
         voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
@@ -151,6 +182,7 @@ static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string ow
         bool salvou = await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, $"Cadastrado {trecho}");
         
         if (salvou) return true;
+        Console.WriteLine($"[RETRY {tentativa}/3] Conflito de SHA no GitHub, tentando novamente...");
         await Task.Delay(500);
     }
     return false;
