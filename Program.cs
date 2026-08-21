@@ -27,52 +27,60 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var reader = new StreamReader(context.Request.Body);
         var body = await reader.ReadToEndAsync();
         
+        // Imprime o JSON bruto nos logs da Render para sabermos exatamente o que chegou
+        Console.WriteLine($"[WEBHOOK RECEBIDO]: {body}");
+
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object &&
-            data.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object &&
-            msg.TryGetProperty("conversation", out var textProp))
+        // Tenta capturar a mensagem independentemente da estrutura exata
+        string textoMensagem = "";
+        string remetente = "";
+
+        if (root.TryGetProperty("data", out var data))
         {
-            var textoMensagem = textProp.GetString()?.Trim() ?? "";
-            
-            if (data.TryGetProperty("key", out var keyProp) && 
-                keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
+            if (data.TryGetProperty("message", out var msg) && msg.TryGetProperty("conversation", out var textProp))
             {
-                var remetente = remoteJidProp.GetString() ?? "";
+                textoMensagem = textProp.GetString()?.Trim() ?? "";
+            }
+            // Fallback para outras estruturas comuns da Evolution API
+            else if (data.TryGetProperty("body", out var bodyProp))
+            {
+                textoMensagem = bodyProp.GetString()?.Trim() ?? "";
+            }
 
-                if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
+            if (data.TryGetProperty("key", out var keyProp) && keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
+            {
+                remetente = remoteJidProp.GetString() ?? "";
+            }
+        }
+
+        if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
+        {
+            var partes = textoMensagem.Split(' ');
+            if (partes.Length >= 3)
+            {
+                var trecho = partes[1].ToUpper();
+                if (decimal.TryParse(partes[2], out var precoMaximo))
                 {
-                    var partes = textoMensagem.Split(' ');
-                    if (partes.Length >= 3)
+                    var telefone = remetente.Contains("@") ? remetente.Split('@')[0] : "55whatsapp";
+
+                    List<VooConfig> voos = new();
+                    if (File.Exists(arquivoVoos))
                     {
-                        var trecho = partes[1].ToUpper();
-                        if (decimal.TryParse(partes[2], out var precoMaximo))
-                        {
-                            var telefone = remetente.Split('@')[0];
-
-                            List<VooConfig> voos = new();
-                            if (File.Exists(arquivoVoos))
-                            {
-                                var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
-                                voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
-                            }
-
-                            voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
-                            voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
-
-                            var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
-                            await File.WriteAllTextAsync(arquivoVoos, novoJson);
-
-                            // 1. Salva automaticamente no GitHub
-                            await SalvarVoosNoGitHubAsync(novoJson);
-
-                            // 2. Envia mensagem de confirmação de volta no WhatsApp via sua Evolution API local
-                            await EnviarMensagemWhatsAppAsync(remetente, $"✅ Alerta cadastrado com sucesso!\nTrecho: {trecho}\nPreço teto: R$ {precoMaximo}");
-
-                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}!");
-                        }
+                        var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
+                        voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
                     }
+
+                    voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
+                    voos.Add(new VooConfig(trecho, precoMaximo, telefone, true));
+
+                    var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
+                    await File.WriteAllTextAsync(arquivoVoos, novoJson);
+
+                    await SalvarVoosNoGitHubAsync(novoJson);
+
+                    Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}!");
                 }
             }
         }
@@ -81,8 +89,8 @@ app.MapPost("/webhook", async (HttpContext context) =>
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO WEBHOOK SILENCIADO]: {ex.Message}");
-        return Results.Ok(new { status = "ignorado" });
+        Console.WriteLine($"[ERRO WEBHOOK]: {ex.Message}");
+        return Results.Ok(new { status = "erro_ignorado" });
     }
 });
 
@@ -131,17 +139,6 @@ async Task SalvarVoosNoGitHubAsync(string conteudoJson)
 
     var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
     await client.PutAsync(url, content);
-}
-
-async Task EnviarMensagemWhatsAppAsync(string remoteJid, string mensagem)
-{
-    try
-    {
-        // Se a sua Evolution API estiver acessível publicamente via túnel ou IP, coloque a URL aqui.
-        // Como ela está no seu localhost:8080, para a Render alcançar o seu PC, ela precisa de um túnel (ex: ngrok).
-        // Se preferir apenas salvar no GitHub sem mandar mensagem instantânea por enquanto, remova esta chamada.
-    }
-    catch { }
 }
 
 record VooConfig(
