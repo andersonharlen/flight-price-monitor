@@ -19,7 +19,7 @@ var instanceName = "voos";
 
 using var httpClient = new HttpClient();
 
-// --- 1. WEBHOOK ---
+// --- 1. WEBHOOK (RESPOSTA IMEDIATA) ---
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
@@ -44,7 +44,12 @@ app.MapPost("/webhook", async (HttpContext context) =>
             bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
             if (fromMe) return Results.Ok(new { status = "ignored_self" });
 
-            string telefone = ExtrairTelefone(itemData, keyElem);
+            // Filtra mensagens de grupo
+            string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? rj.GetString() ?? "" : "";
+            if (remoteJid.EndsWith("@g.us")) 
+                return Results.Ok(new { status = "ignored_group" });
+
+            string telefone = remoteJid.Split('@')[0].Split(':')[0];
             if (string.IsNullOrEmpty(telefone)) return Results.Ok(new { status = "no_phone" });
 
             string textoMensagem = "";
@@ -54,19 +59,31 @@ app.MapPost("/webhook", async (HttpContext context) =>
             }
 
             textoMensagem = textoMensagem.Trim();
-            if (string.IsNullOrEmpty(textoMensagem)) return Results.Ok(new { status = "ignored_non_text_event" });
+            if (string.IsNullOrEmpty(textoMensagem)) return Results.Ok(new { status = "ignored_non_text" });
 
-            Console.WriteLine($"[WHATSAPP MENSAGEM] De: {telefone} | Texto: '{textoMensagem}'");
+            Console.WriteLine($"[WHATSAPP DIRETO] De: {telefone} | Texto: '{textoMensagem}'");
 
-            // Comando CADASTRAR (Ex: CADASTRAR MGF-AJU 900)
+            // Comando CADASTRAR
             if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
             {
                 var partes = textoMensagem.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                 if (partes.Length >= 3 && decimal.TryParse(partes[2], out decimal precoTeto))
                 {
                     string trecho = partes[1].ToUpper();
+                    
                     bool ok = await SalvarCadastroComRetryAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
-                    Console.WriteLine(ok ? $"[SUCESSO] Voo {trecho} cadastrado para {telefone}" : $"[ERRO] Falha ao cadastrar no GitHub.");
+                    
+                    if (ok)
+                    {
+                        Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado no GitHub para {telefone}");
+                        string msgConfirmacao = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ *Trecho:* {trecho}\n💰 *Preço Teto:* R$ {precoTeto:N2}\n\nVocê receberá atualizações automáticas assim que encontrarmos passagens abaixo deste valor.";
+                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, msgConfirmacao);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[ERRO] Falha ao cadastrar no GitHub para {telefone}");
+                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "❌ Não foi possível salvar seu alerta. Tente novamente em alguns instantes.");
+                    }
                 }
             }
             // Comando BUSCAR
@@ -84,64 +101,37 @@ app.MapPost("/webhook", async (HttpContext context) =>
     return Results.Ok(new { status = "processed" });
 });
 
-// --- 2. WORKER EM SEGUNDO PLANO ---
+// --- 2. WORKER EM SEGUNDO PLANO (APENAS VARREDURA HORA EM HORA) ---
 _ = Task.Run(async () =>
 {
-    var timerAlertaAutomatico = DateTime.MinValue;
-
     while (true)
     {
         try
         {
-            await ProcessarPendenciasGitHubAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
-
-            if (DateTime.UtcNow - timerAlertaAutomatico > TimeSpan.FromHours(1))
-            {
-                timerAlertaAutomatico = DateTime.UtcNow;
-                await ExecutarVarreduraGeralAlertasAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
-            }
+            await Task.Delay(TimeSpan.FromHours(1));
+            await ExecutarVarreduraGeralAlertasAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERRO WORKER]: {ex.Message}");
         }
-
-        await Task.Delay(TimeSpan.FromSeconds(15));
     }
 });
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
 
-// --- EXTRATORES CORRIGIDOS ---
-static string ExtrairTelefone(JsonElement itemData, JsonElement keyElem)
-{
-    string raw = "";
-    // Prioriza o remetente individual em mensagens de grupos
-    if (keyElem.TryGetProperty("participant", out var kp) && kp.ValueKind == JsonValueKind.String)
-        raw = kp.GetString() ?? "";
-    else if (itemData.TryGetProperty("participant", out var p) && p.ValueKind == JsonValueKind.String)
-        raw = p.GetString() ?? "";
-    else if (keyElem.TryGetProperty("remoteJid", out var rj) && rj.ValueKind == JsonValueKind.String)
-        raw = rj.GetString() ?? "";
-
-    if (string.IsNullOrEmpty(raw)) return "";
-    return raw.Split('@')[0].Split(':')[0];
-}
-
+// --- EXTRATORES ---
 static string ExtrairTextoMensagem(JsonElement msgElem)
 {
     if (msgElem.ValueKind != JsonValueKind.Object) return "";
 
-    // Mensagem simples
     if (msgElem.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String)
         return c.GetString() ?? "";
 
-    // Mensagem estendida (com links ou formatação)
     if (msgElem.TryGetProperty("extendedTextMessage", out var ext) && ext.TryGetProperty("text", out var extText))
         return extText.GetString() ?? "";
 
-    // Legenda de imagem/mídia
     if (msgElem.TryGetProperty("imageMessage", out var img) && img.TryGetProperty("caption", out var cap))
         return cap.GetString() ?? "";
 
@@ -155,7 +145,7 @@ static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string ow
     {
         var (voos, sha) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
         voos.RemoveAll(v => v.Trecho == trecho && v.Telefone == telefone);
-        voos.Add(new VooConfig(trecho, precoTeto, telefone, true));
+        voos.Add(new VooConfig(trecho, precoTeto, telefone));
 
         var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
         bool salvou = await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, $"Cadastrado {trecho}");
@@ -164,34 +154,6 @@ static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string ow
         await Task.Delay(500);
     }
     return false;
-}
-
-static async Task ProcessarPendenciasGitHubAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey)
-{
-    var (voos, sha) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
-    bool alterou = false;
-
-    for (int i = 0; i < voos.Count; i++)
-    {
-        if (voos[i].PendenteEnvio)
-        {
-            var voo = voos[i];
-            string msg = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ *Trecho:* {voo.Trecho}\n💰 *Preço Teto:* R$ {voo.PrecoMaximo}\n\nVocê receberá atualizações automáticas assim que encontrarmos passagens abaixo deste valor.";
-            
-            bool enviado = await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, msg);
-            if (enviado)
-            {
-                voos[i] = voo with { PendenteEnvio = false };
-                alterou = true;
-            }
-        }
-    }
-
-    if (alterou)
-    {
-        var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
-        await SalvarVoosNoGitHubAsync(client, owner, repo, path, token, novoJson, sha, "Pendencias confirmadas");
-    }
 }
 
 static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey, string telefoneDestino)
@@ -291,4 +253,4 @@ static async Task<bool> EnviarWhatsAppAsync(HttpClient client, string baseUrl, s
     catch { return false; }
 }
 
-public record VooConfig([property: JsonPropertyName("Trecho")] string Trecho, [property: JsonPropertyName("PrecoMaximo")] decimal PrecoMaximo, [property: JsonPropertyName("Telefone")] string Telefone, [property: JsonPropertyName("PendenteEnvio")] bool PendenteEnvio);
+public record VooConfig([property: JsonPropertyName("Trecho")] string Trecho, [property: JsonPropertyName("PrecoMaximo")] decimal PrecoMaximo, [property: JsonPropertyName("Telefone")] string Telefone);
