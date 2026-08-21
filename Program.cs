@@ -31,9 +31,8 @@ app.MapPost("/webhook", async (HttpContext context) =>
         var root = doc.RootElement;
 
         string textoMensagem = "";
-        string remetente = "";
+        string remoteJid = "";
 
-        // Verifica se o evento é de mensagem recebida (messages.upsert)
         if (root.TryGetProperty("event", out var eventProp) && eventProp.GetString() == "messages.upsert")
         {
             if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
@@ -42,7 +41,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
                 {
                     if (keyProp.TryGetProperty("remoteJid", out var remoteJidProp))
                     {
-                        remetente = remoteJidProp.GetString() ?? "";
+                        remoteJid = remoteJidProp.GetString() ?? "";
                     }
                 }
 
@@ -69,7 +68,7 @@ app.MapPost("/webhook", async (HttpContext context) =>
                 var trecho = partes[1].ToUpper();
                 if (decimal.TryParse(partes[2], out var precoMaximo))
                 {
-                    var telefone = remetente.Contains("@") ? remetente.Split('@')[0] : "55whatsapp";
+                    var telefone = remoteJid.Contains("@") ? remoteJid.Split('@')[0] : "55whatsapp";
 
                     List<VooConfig> voos = new();
                     if (File.Exists(arquivoVoos))
@@ -84,7 +83,15 @@ app.MapPost("/webhook", async (HttpContext context) =>
                     var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
                     await File.WriteAllTextAsync(arquivoVoos, novoJson);
 
+                    // 1. Salva no GitHub
                     await SalvarVoosNoGitHubAsync(novoJson);
+
+                    // 2. Envia a confirmação de volta no WhatsApp
+                    if (!string.IsNullOrEmpty(remoteJid))
+                    {
+                        var respostaTexto = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ Trecho: {trecho}\n💰 Preço Teto: R$ {precoMaximo}";
+                        await EnviarMensagemWhatsAppAsync(remoteJid, respostaTexto);
+                    }
 
                     Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}!");
                 }
@@ -145,6 +152,35 @@ async Task SalvarVoosNoGitHubAsync(string conteudoJson)
 
     var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
     await client.PutAsync(url, content);
+}
+
+async Task EnviarMensagemWhatsAppAsync(string remoteJid, string mensagem)
+{
+    try
+    {
+        // Pegando as configs de ambiente da Render (ou valores padrão)
+        var evolutionApiUrl = Environment.GetEnvironmentVariable("EVOLUTION_API_URL") ?? "http://localhost:8080";
+        var evolutionApiKey = Environment.GetEnvironmentVariable("EVOLUTION_API_KEY") ?? "B2AC8C01-9A1F-4EE0-9D38-C65B3938EC9A";
+        var instanceName = "voos";
+
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("apikey", evolutionApiKey);
+
+        var url = $"{evolutionApiUrl}/message/sendText/{instanceName}";
+
+        var payload = new
+        {
+            number = remoteJid,
+            text = mensagem
+        };
+
+        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        await client.PostAsync(url, content);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERRO AO ENVIAR WHATSAPP]: {ex.Message}");
+    }
 }
 
 record VooConfig(
