@@ -64,10 +64,13 @@ app.MapPost("/webhook", async (HttpContext context) =>
                             var novoJson = JsonSerializer.Serialize(voos, new JsonSerializerOptions { WriteIndented = true });
                             await File.WriteAllTextAsync(arquivoVoos, novoJson);
 
-                            // Salva automaticamente no GitHub para persistir no repositório
+                            // 1. Salva automaticamente no GitHub
                             await SalvarVoosNoGitHubAsync(novoJson);
 
-                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo} e salvo no GitHub!");
+                            // 2. Envia mensagem de confirmação de volta no WhatsApp via sua Evolution API local
+                            await EnviarMensagemWhatsAppAsync(remetente, $"✅ Alerta cadastrado com sucesso!\nTrecho: {trecho}\nPreço teto: R$ {precoMaximo}");
+
+                            Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}!");
                         }
                     }
                 }
@@ -128,6 +131,17 @@ async Task SalvarVoosNoGitHubAsync(string conteudoJson)
 
     var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
     await client.PutAsync(url, content);
+}
+
+async Task EnviarMensagemWhatsAppAsync(string remoteJid, string mensagem)
+{
+    try
+    {
+        // Se a sua Evolution API estiver acessível publicamente via túnel ou IP, coloque a URL aqui.
+        // Como ela está no seu localhost:8080, para a Render alcançar o seu PC, ela precisa de um túnel (ex: ngrok).
+        // Se preferir apenas salvar no GitHub sem mandar mensagem instantânea por enquanto, remova esta chamada.
+    }
+    catch { }
 }
 
 record VooConfig(
