@@ -20,7 +20,7 @@ var instanceName = "voos";
 
 using var httpClient = new HttpClient();
 
-// --- 1. WEBHOOK BLINDADO ---
+// --- WEBHOOK MODO "RAIO-X" ---
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
@@ -33,74 +33,99 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
-        // 1. Busca magicamente o bloco que contém o remetente (key) em QUALQUER nível do JSON
+        // Verifica se é evento da Evolution
+        string eventType = "";
+        if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("event", out var ev))
+            eventType = ev.GetString() ?? "";
+
+        // Ignora spams de leitura/online da Evolution silenciosamente para não sujar o log
+        if (!string.IsNullOrEmpty(eventType) && eventType != "messages.upsert") 
+            return Results.Ok();
+
+        Console.WriteLine("\n==========================================");
+        Console.WriteLine("[📩 NOVA MENSAGEM] Identificada, analisando...");
+
         var targetNodeOpt = EncontrarNoComKeyMessage(root);
-        if (targetNodeOpt == null) return Results.Ok(); // Não é evento de mensagem válida
+        if (targetNodeOpt == null)
+        {
+            Console.WriteLine(" ❌ IGNORADO: O JSON não contém a estrutura de mensagem (key).");
+            return Results.Ok();
+        }
 
         var node = targetNodeOpt.Value;
         var keyElem = node.GetProperty("key");
 
-        // 2. Filtros: Ignorar nós mesmos e grupos
-        if (keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean()) return Results.Ok();
-        
+        bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
         string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? rj.GetString() ?? "" : "";
-        if (remoteJid.EndsWith("@g.us")) return Results.Ok();
+        
+        Console.WriteLine($" 👤 JID: {remoteJid} | fromMe (Fui eu mesmo?): {fromMe}");
+
+        if (remoteJid.EndsWith("@g.us"))
+        {
+            Console.WriteLine(" ❌ IGNORADO: Mensagem veio de um grupo.");
+            return Results.Ok();
+        }
 
         string telefone = remoteJid.Split('@')[0].Split(':')[0];
-        if (string.IsNullOrEmpty(telefone)) return Results.Ok();
-
-        // 3. Extrai o texto de qualquer lugar onde a API tenha escondido
         string textoMensagem = ExtrairTextoRobusto(node).Trim();
-        if (string.IsNullOrEmpty(textoMensagem)) return Results.Ok();
 
-        Console.WriteLine($"[WHATSAPP DIRETO] De: {telefone} | Recebido: '{textoMensagem}'");
+        Console.WriteLine($" 📝 TEXTO EXTRAÍDO: '{textoMensagem}'");
+
+        if (string.IsNullOrEmpty(textoMensagem))
+        {
+            Console.WriteLine(" ❌ IGNORADO: Não encontrei texto. Pode ser figurinha, áudio ou erro de parse.");
+            Console.WriteLine($" 📦 PAYLOAD SUSPEITO: {body}");
+            return Results.Ok();
+        }
 
         // --- COMANDOS ---
         if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
         {
+            Console.WriteLine(" ⚡ COMANDO RECONHECIDO: CADASTRAR");
             var partes = textoMensagem.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (partes.Length >= 3)
             {
                 string trecho = partes[1].ToUpper();
-                string precoStr = partes[2].Replace(",", "."); // Proteção contra vírgula
+                string precoStr = partes[2].Replace(",", ".");
                 
                 if (decimal.TryParse(precoStr, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal precoTeto))
                 {
-                    Console.WriteLine($"[AÇÃO] Cadastrando {trecho} com teto R$ {precoTeto}");
+                    Console.WriteLine($" 💾 INICIANDO SALVAMENTO NO GITHUB... ({trecho} a R$ {precoTeto})");
                     bool ok = await SalvarCadastroComRetryAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
                     
                     if (ok)
                     {
-                        string msgConfirmacao = $"✅ *Alerta Cadastrado com Sucesso!*\n\n✈️ *Trecho:* {trecho}\n💰 *Preço Teto:* R$ {precoTeto:N2}\n\nVocê receberá alertas assim que encontrarmos voos abaixo deste valor.";
-                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, msgConfirmacao);
+                        Console.WriteLine(" ✅ GITHUB ATUALIZADO! Mandando WhatsApp...");
+                        string msg = $"✅ *Alerta Cadastrado!*\n✈️ *Trecho:* {trecho}\n💰 *Teto:* R$ {precoTeto:N2}";
+                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, msg);
                     }
                     else
                     {
-                        await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "❌ Erro ao salvar no banco de dados do GitHub. Tente novamente.");
+                        Console.WriteLine(" ❌ ERRO: O GitHub recusou a atualização (Token inválido ou limite da API?).");
                     }
-                }
-                else
-                {
-                    await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "⚠️ Preço inválido. Exemplo correto: *CADASTRAR MGF-AJU 900*");
                 }
             }
         }
         else if (textoMensagem.Equals("BUSCAR", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine($"[AÇÃO] Busca manual iniciada para {telefone}");
-            await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "🔍 Iniciando varredura das suas passagens cadastradas...");
+            Console.WriteLine(" ⚡ COMANDO RECONHECIDO: BUSCAR");
+            await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "🔍 Buscando passagens...");
             _ = Task.Run(() => ExecutarVarreduraDePrecosAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey, telefone));
+        }
+        else
+        {
+            Console.WriteLine(" ℹ️ TEXTO IGNORADO: Não é nem BUSCAR nem CADASTRAR.");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERRO CRÍTICO WEBHOOK]: {ex.Message}\nPayload Recebido: {body}");
+        Console.WriteLine($"\n[ERRO CRÍTICO NO WEBHOOK]: {ex.Message}\nPayload: {body}");
     }
 
     return Results.Ok(new { status = "processed" });
 });
 
-// --- 2. WORKER (VARREDURA HORA EM HORA) ---
+// --- WORKER DE HORA EM HORA ---
 _ = Task.Run(async () =>
 {
     while (true)
@@ -108,13 +133,10 @@ _ = Task.Run(async () =>
         try
         {
             await Task.Delay(TimeSpan.FromHours(1));
-            Console.WriteLine("[WORKER] Iniciando varredura de hora em hora...");
+            Console.WriteLine("[WORKER] Varredura agendada iniciada...");
             await ExecutarVarreduraGeralAlertasAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey);
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERRO WORKER]: {ex.Message}");
-        }
+        catch { }
     }
 });
 
@@ -123,16 +145,14 @@ app.Run($"http://0.0.0.0:{port}");
 
 
 // ====================================================================
-// FUNÇÕES CAÇA-NÍQUEL (BUSCA RECURSIVA NO JSON)
+// MÉTODOS BASE (Sem alterações destrutivas)
 // ====================================================================
 
-// Procura em todo o JSON até achar a propriedade 'key' que tenha 'remoteJid'
 static JsonElement? EncontrarNoComKeyMessage(JsonElement element)
 {
     if (element.ValueKind == JsonValueKind.Object)
     {
         if (element.TryGetProperty("key", out var key) && key.TryGetProperty("remoteJid", out _)) return element;
-
         foreach (var prop in element.EnumerateObject())
         {
             var found = EncontrarNoComKeyMessage(prop.Value);
@@ -150,14 +170,13 @@ static JsonElement? EncontrarNoComKeyMessage(JsonElement element)
     return null;
 }
 
-// Procura em todo o JSON pelas propriedades conhecidas de texto
 static string ExtrairTextoRobusto(JsonElement element)
 {
     if (element.ValueKind == JsonValueKind.Object)
     {
         if (element.TryGetProperty("conversation", out var c) && c.ValueKind == JsonValueKind.String) return c.GetString() ?? "";
         if (element.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String) return t.GetString() ?? "";
-        if (element.TryGetProperty("caption", out var cap) && cap.ValueKind == JsonValueKind.String) return cap.GetString() ?? ""; // Pra foto com legenda
+        if (element.TryGetProperty("caption", out var cap) && cap.ValueKind == JsonValueKind.String) return cap.GetString() ?? "";
 
         foreach (var prop in element.EnumerateObject())
         {
@@ -175,10 +194,6 @@ static string ExtrairTextoRobusto(JsonElement element)
     }
     return "";
 }
-
-// ====================================================================
-// LÓGICA DE NEGÓCIO E INTEGRAÇÕES
-// ====================================================================
 
 static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string owner, string repo, string path, string token, string trecho, decimal precoTeto, string telefone)
 {
@@ -204,30 +219,26 @@ static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner
 
     if (!meusVoos.Any())
     {
-        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "⚠️ Você não possui nenhum trecho cadastrado no momento.");
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "⚠️ Você não possui alertas cadastrados no momento.");
         return;
     }
 
     int encontrados = 0;
     foreach (var voo in meusVoos)
     {
-        bool achouPrecoBom = await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo);
-        if (achouPrecoBom) encontrados++;
+        if (await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo)) encontrados++;
     }
 
     if (encontrados == 0)
     {
-        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "📉 Busca finalizada. No momento, não há voos abaixo dos tetos que você configurou.");
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "📉 Busca finalizada. No momento, não há voos abaixo dos seus tetos.");
     }
 }
 
 static async Task ExecutarVarreduraGeralAlertasAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey)
 {
     var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
-    foreach (var voo in voos)
-    {
-        await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo);
-    }
+    foreach (var voo in voos) await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo);
 }
 
 static async Task<bool> ProcessarEEnviarAlertaVooAsync(HttpClient client, string apiUrl, string instance, string apiKey, VooConfig voo)
@@ -236,15 +247,13 @@ static async Task<bool> ProcessarEEnviarAlertaVooAsync(HttpClient client, string
     if (partes.Length < 2) return false;
 
     string orig = partes[0], dest = partes[1];
-    
-    // MOCK: Valor simulado (substituir depois pela raspagem real)
     decimal precoEncontrado = 680.00m; 
     DateTime dataVoo = DateTime.Now.AddDays(30);
 
     if (precoEncontrado <= voo.PrecoMaximo)
     {
         string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+so+ida+de+{orig}+para+{dest}+em+{dataVoo:yyyy-MM-dd}";
-        string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço Encontrado:* R$ {precoEncontrado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 *Confira e compre aqui:* {urlGoogle}";
+        string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço Encontrado:* R$ {precoEncontrado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 {urlGoogle}";
 
         await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, msg);
         return true;
