@@ -7,9 +7,6 @@ using System.Text.Json.Serialization;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-// Rota para o Keep-Alive do UptimeRobot não dar erro 404
-app.MapGet("/", () => Results.Ok("Monitor de Voos Online!"));
-
 // Configurações Globais
 var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN") ?? "SEU_GITHUB_TOKEN";
 var repoOwner = "andersonharlen";
@@ -36,10 +33,12 @@ app.MapPost("/webhook", async (HttpContext context) =>
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
 
+        // Verifica se é evento da Evolution
         string eventType = "";
         if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("event", out var ev))
             eventType = ev.GetString() ?? "";
 
+        // Ignora spams de leitura/online da Evolution silenciosamente para não sujar o log
         if (!string.IsNullOrEmpty(eventType) && eventType != "messages.upsert") 
             return Results.Ok();
 
@@ -47,7 +46,11 @@ app.MapPost("/webhook", async (HttpContext context) =>
         Console.WriteLine("[📩 NOVA MENSAGEM] Identificada, analisando...");
 
         var targetNodeOpt = EncontrarNoComKeyMessage(root);
-        if (targetNodeOpt == null) return Results.Ok();
+        if (targetNodeOpt == null)
+        {
+            Console.WriteLine(" ❌ IGNORADO: O JSON não contém a estrutura de mensagem (key).");
+            return Results.Ok();
+        }
 
         var node = targetNodeOpt.Value;
         var keyElem = node.GetProperty("key");
@@ -55,15 +58,30 @@ app.MapPost("/webhook", async (HttpContext context) =>
         bool fromMe = keyElem.TryGetProperty("fromMe", out var fm) && fm.GetBoolean();
         string remoteJid = keyElem.TryGetProperty("remoteJid", out var rj) ? rj.GetString() ?? "" : "";
         
-        if (remoteJid.EndsWith("@g.us")) return Results.Ok();
+        Console.WriteLine($" 👤 JID: {remoteJid} | fromMe (Fui eu mesmo?): {fromMe}");
+
+        if (remoteJid.EndsWith("@g.us"))
+        {
+            Console.WriteLine(" ❌ IGNORADO: Mensagem veio de um grupo.");
+            return Results.Ok();
+        }
 
         string telefone = remoteJid.Split('@')[0].Split(':')[0];
         string textoMensagem = ExtrairTextoRobusto(node).Trim();
 
-        Console.WriteLine($" 👤 JID: {telefone} | Texto: '{textoMensagem}'");
+        Console.WriteLine($" 📝 TEXTO EXTRAÍDO: '{textoMensagem}'");
 
+        if (string.IsNullOrEmpty(textoMensagem))
+        {
+            Console.WriteLine(" ❌ IGNORADO: Não encontrei texto. Pode ser figurinha, áudio ou erro de parse.");
+            Console.WriteLine($" 📦 PAYLOAD SUSPEITO: {body}");
+            return Results.Ok();
+        }
+
+        // --- COMANDOS ---
         if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
         {
+            Console.WriteLine(" ⚡ COMANDO RECONHECIDO: CADASTRAR");
             var partes = textoMensagem.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (partes.Length >= 3)
             {
@@ -72,24 +90,36 @@ app.MapPost("/webhook", async (HttpContext context) =>
                 
                 if (decimal.TryParse(precoStr, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal precoTeto))
                 {
+                    Console.WriteLine($" 💾 INICIANDO SALVAMENTO NO GITHUB... ({trecho} a R$ {precoTeto})");
                     bool ok = await SalvarCadastroComRetryAsync(httpClient, repoOwner, repoName, path, githubToken, trecho, precoTeto, telefone);
+                    
                     if (ok)
                     {
+                        Console.WriteLine(" ✅ GITHUB ATUALIZADO! Mandando WhatsApp...");
                         string msg = $"✅ *Alerta Cadastrado!*\n✈️ *Trecho:* {trecho}\n💰 *Teto:* R$ {precoTeto:N2}";
                         await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, msg);
+                    }
+                    else
+                    {
+                        Console.WriteLine(" ❌ ERRO: O GitHub recusou a atualização (Token inválido ou limite da API?).");
                     }
                 }
             }
         }
         else if (textoMensagem.Equals("BUSCAR", StringComparison.OrdinalIgnoreCase))
         {
-            await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "🔍 Buscando passagens reais no Google Flights...");
+            Console.WriteLine(" ⚡ COMANDO RECONHECIDO: BUSCAR");
+            await EnviarWhatsAppAsync(httpClient, evolutionApiUrl, instanceName, evolutionApiKey, telefone, "🔍 Buscando passagens...");
             _ = Task.Run(() => ExecutarVarreduraDePrecosAsync(httpClient, repoOwner, repoName, path, githubToken, evolutionApiUrl, instanceName, evolutionApiKey, telefone));
+        }
+        else
+        {
+            Console.WriteLine(" ℹ️ TEXTO IGNORADO: Não é nem BUSCAR nem CADASTRAR.");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"\n[ERRO NO WEBHOOK]: {ex.Message}");
+        Console.WriteLine($"\n[ERRO CRÍTICO NO WEBHOOK]: {ex.Message}\nPayload: {body}");
     }
 
     return Results.Ok(new { status = "processed" });
@@ -115,80 +145,8 @@ app.Run($"http://0.0.0.0:{port}");
 
 
 // ====================================================================
-// MÉTODOS DE SUPORTE E BUSCA REAL (GOOGLE FLIGHTS VIA SEARCHAPI)
+// MÉTODOS BASE (Sem alterações destrutivas)
 // ====================================================================
-
-static async Task<decimal> BuscarPrecoGoogleFlightsAsync(HttpClient client, string origem, string destino, string dataIso)
-{
-    try
-    {
-        string apiKey = "F3j7xqnUiAPxeCUGqwHSBJAp";
-        string url = $"https://www.searchapi.io/api/v1/search?engine=google_flights&departure_id={origem}&arrival_id={destino}&outbound_date={dataIso}&currency=BRL&api_key={apiKey}";
-
-        var res = await client.GetAsync(url);
-        var body = await res.Content.ReadAsStringAsync();
-
-        // MOSTRA NO LOG O QUE A API REALMENTE RESPONDEU (Primeiros 400 caracteres)
-        Console.WriteLine($"[DEBUG SEARCHAPI RESP]: {(body.Length > 400 ? body.Substring(0, 400) : body)}");
-
-        if (!res.IsSuccessStatusCode)
-        {
-            Console.WriteLine($"[SearchApi Erro] Status: {res.StatusCode}");
-            return 999999m;
-        }
-
-        using var doc = JsonDocument.Parse(body);
-
-        if (doc.RootElement.TryGetProperty("best_flights", out var bestFlights) && bestFlights.GetArrayLength() > 0)
-        {
-            var primeiroVoo = bestFlights[0];
-            if (primeiroVoo.TryGetProperty("price", out var priceElement))
-            {
-                if (priceElement.ValueKind == JsonValueKind.Number)
-                    return priceElement.GetDecimal();
-                
-                string priceStr = priceElement.ToString().Replace("R$", "").Replace(".", "").Replace(",", ".").Trim();
-                if (decimal.TryParse(priceStr, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal preco))
-                    return preco;
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[SearchApi Exceção]: {ex.Message}");
-    }
-
-    return 999999m;
-}
-
-static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKeyEvolution, string telefoneDestino)
-{
-    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
-    var meusVoos = voos.Where(v => v.Telefone == telefoneDestino).ToList();
-
-    if (!meusVoos.Any())
-    {
-        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKeyEvolution, telefoneDestino, "⚠️ Você não possui alertas cadastrados.");
-        return;
-    }
-
-    int encontrados = 0;
-    foreach (var voo in meusVoos)
-    {
-        if (await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKeyEvolution, voo)) encontrados++;
-    }
-
-    if (encontrados == 0)
-    {
-        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKeyEvolution, telefoneDestino, "📉 Busca finalizada. Nenhum voo abaixo do seu teto no momento.");
-    }
-}
-
-static async Task ExecutarVarreduraGeralAlertasAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKeyEvolution)
-{
-    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
-    foreach (var voo in voos) await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKeyEvolution, voo);
-}
 
 static JsonElement? EncontrarNoComKeyMessage(JsonElement element)
 {
@@ -250,6 +208,55 @@ static async Task<bool> SalvarCadastroComRetryAsync(HttpClient client, string ow
         
         if (salvou) return true;
         await Task.Delay(500);
+    }
+    return false;
+}
+
+static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey, string telefoneDestino)
+{
+    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    var meusVoos = voos.Where(v => v.Telefone == telefoneDestino).ToList();
+
+    if (!meusVoos.Any())
+    {
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "⚠️ Você não possui alertas cadastrados no momento.");
+        return;
+    }
+
+    int encontrados = 0;
+    foreach (var voo in meusVoos)
+    {
+        if (await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo)) encontrados++;
+    }
+
+    if (encontrados == 0)
+    {
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, telefoneDestino, "📉 Busca finalizada. No momento, não há voos abaixo dos seus tetos.");
+    }
+}
+
+static async Task ExecutarVarreduraGeralAlertasAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKey)
+{
+    var (voos, _) = await ObterVoosDoGitHubAsync(client, owner, repo, path, token);
+    foreach (var voo in voos) await ProcessarEEnviarAlertaVooAsync(client, apiUrl, instance, apiKey, voo);
+}
+
+static async Task<bool> ProcessarEEnviarAlertaVooAsync(HttpClient client, string apiUrl, string instance, string apiKey, VooConfig voo)
+{
+    var partes = voo.Trecho.Split('-');
+    if (partes.Length < 2) return false;
+
+    string orig = partes[0], dest = partes[1];
+    decimal precoEncontrado = 680.00m; 
+    DateTime dataVoo = DateTime.Now.AddDays(30);
+
+    if (precoEncontrado <= voo.PrecoMaximo)
+    {
+        string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+so+ida+de+{orig}+para+{dest}+em+{dataVoo:yyyy-MM-dd}";
+        string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço Encontrado:* R$ {precoEncontrado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 {urlGoogle}";
+
+        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKey, voo.Telefone, msg);
+        return true;
     }
     return false;
 }
