@@ -1,51 +1,36 @@
 using System.Text;
 using System.Text.Json;
 
-var apiUrl = Environment.GetEnvironmentVariable("EVOLUTION_API_URL");
-var apiKey = Environment.GetEnvironmentVariable("EVOLUTION_API_KEY");
+var builder = WebApplication.CreateBuilder(args);
+
+// Configura a porta que a Render exige (variável PORT ou 8080)
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+builder.WebHost.UseUrls($"http://*:{port}");
+
+var app = builder.Build();
+
 var arquivoVoos = "voos.json";
 
-if (!File.Exists(arquivoVoos))
+// Rota de Teste para ver se o app está no ar
+app.MapGet("/", () => "API de Monitoramento de Voos Rodando!");
+
+// Rota que vai receber o webhook do WhatsApp (Evolution API)
+app.MapPost("/webhook", async (HttpContext context) =>
 {
-    Console.WriteLine("[ERRO] Arquivo voos.json não encontrado.");
-    return;
-}
-
-var jsonContent = await File.ReadAllTextAsync(arquivoVoos);
-var voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonContent);
-
-if (voos == null || voos.Count == 0)
-{
-    Console.WriteLine("[INFO] Nenhum voo cadastrado para monitorar.");
-    return;
-}
-
-using var client = new HttpClient();
-client.DefaultRequestHeaders.Add("apikey", apiKey);
-
-foreach (var voo in voos)
-{
-    Console.WriteLine($"[MONITOR] Verificando: {voo.Trecho} (Teto: R$ {voo.PrecoMaximo})");
-
-    // Aqui entra a lógica de buscar o preço atual do voo
-    decimal precoAtual = BuscarPrecoAtual(voo.Trecho); 
-
-    if (precoAtual <= voo.PrecoMaximo)
+    try
     {
-        var mensagem = $"🚨 *Promoção Encontrada!*\nTrecho: {voo.Trecho}\nPreço atual: R$ {precoAtual}";
+        using var reader = new StreamReader(context.Request.Body);
+        var body = await reader.ReadToEndAsync();
         
-        var payload = new { number = voo.Telefone, text = mensagem };
-        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        // Aqui você pode processar a mensagem que veio do WhatsApp e salvar no voos.json
+        Console.WriteLine($"[WEBHOOK] Mensagem recebida: {body}");
 
-        var response = await client.PostAsync($"{apiUrl}/message/sendText/voos", content);
-        Console.WriteLine($"[SUCESSO] Alerta enviado para {voo.Telefone}. Status: {response.StatusCode}");
+        return Results.Ok(new { status = "recebido" });
     }
-}
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { erro = ex.Message });
+    }
+});
 
-decimal BuscarPrecoAtual(string trecho)
-{
-    // Substitua pela sua busca real de preços
-    return 2400.00m; 
-}
-
-record VooConfig(string Trecho, decimal PrecoMaximo, string Telefone);
+app.Run();
