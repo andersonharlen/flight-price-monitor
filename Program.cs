@@ -126,13 +126,17 @@ static async Task<decimal> BuscarPrecoGoogleFlightsAsync(HttpClient client, stri
         string url = $"https://www.searchapi.io/api/v1/search?engine=google_flights&departure_id={origem}&arrival_id={destino}&outbound_date={dataIso}&currency=BRL&api_key={apiKey}";
 
         var res = await client.GetAsync(url);
+        var body = await res.Content.ReadAsStringAsync();
+
+        // MOSTRA NO LOG O QUE A API REALMENTE RESPONDEU (Primeiros 400 caracteres)
+        Console.WriteLine($"[DEBUG SEARCHAPI RESP]: {(body.Length > 400 ? body.Substring(0, 400) : body)}");
+
         if (!res.IsSuccessStatusCode)
         {
             Console.WriteLine($"[SearchApi Erro] Status: {res.StatusCode}");
             return 999999m;
         }
 
-        var body = await res.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(body);
 
         if (doc.RootElement.TryGetProperty("best_flights", out var bestFlights) && bestFlights.GetArrayLength() > 0)
@@ -154,33 +158,7 @@ static async Task<decimal> BuscarPrecoGoogleFlightsAsync(HttpClient client, stri
         Console.WriteLine($"[SearchApi Exceção]: {ex.Message}");
     }
 
-    return 999999m; // Retorna um valor alto se falhar para não disparar alarme falso
-}
-
-static async Task<bool> ProcessarEEnviarAlertaVooAsync(HttpClient client, string apiUrl, string instance, string apiKeyEvolution, VooConfig voo)
-{
-    var partes = voo.Trecho.Split('-');
-    if (partes.Length < 2) return false;
-
-    string orig = partes[0].Trim();
-    string dest = partes[1].Trim();
-    
-    DateTime dataVoo = DateTime.Now.AddDays(30);
-    string dataIso = dataVoo.ToString("yyyy-MM-dd");
-
-    // BUSCA REAL NO GOOGLE FLIGHTS
-    decimal precoEncontrado = await BuscarPrecoGoogleFlightsAsync(client, orig, dest, dataIso);
-    Console.WriteLine($"[BUSCA] {orig} ➔ {dest} em {dataIso}: R$ {precoEncontrado}");
-
-    if (precoEncontrado <= voo.PrecoMaximo)
-    {
-        string urlGoogle = $"https://www.google.com/travel/flights?q=Voos+so+ida+de+{orig}+para+{dest}+em+{dataIso}";
-        string msg = $"🚨 *OFERTA ENCONTRADA!* 🚨\n\n✈️ *Trecho:* {orig} ➔ {dest}\n📅 *Data:* {dataVoo:dd/MM/yyyy}\n💰 *Preço:* R$ {precoEncontrado:N2}\n🎯 *Seu Teto:* R$ {voo.PrecoMaximo:N2}\n\n🔗 {urlGoogle}";
-
-        await EnviarWhatsAppAsync(client, apiUrl, instance, apiKeyEvolution, voo.Telefone, msg);
-        return true;
-    }
-    return false;
+    return 999999m;
 }
 
 static async Task ExecutarVarreduraDePrecosAsync(HttpClient client, string owner, string repo, string path, string token, string apiUrl, string instance, string apiKeyEvolution, string telefoneDestino)
