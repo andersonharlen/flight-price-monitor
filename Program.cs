@@ -9,9 +9,13 @@ var app = builder.Build();
 
 var arquivoVoos = "voos.json";
 
+// Pega as credenciais da Evolution API das variáveis de ambiente da Render (ou define fixas se preferir)
+var evolutionApiUrl = Environment.GetEnvironmentVariable("EVOLUTION_API_URL") ?? "https://sua-evolution-api.com";
+var evolutionApiKey = Environment.GetEnvironmentVariable("EVOLUTION_API_KEY") ?? "sua-api-key";
+var instanceName = Environment.GetEnvironmentVariable("EVOLUTION_INSTANCE") ?? "voos";
+
 app.MapGet("/", () => "API de Monitoramento de Voos Rodando!");
 
-// Webhook para receber comandos do WhatsApp
 app.MapPost("/webhook", async (HttpContext context) =>
 {
     try
@@ -29,7 +33,6 @@ app.MapPost("/webhook", async (HttpContext context) =>
             var textoMensagem = textProp.GetString()?.Trim() ?? "";
             var remetente = data.GetProperty("key").GetProperty("remoteJid").GetString() ?? "";
 
-            // 1. Comando CADASTRAR: CADASTRAR MGF-AJU 800
             if (textoMensagem.StartsWith("CADASTRAR", StringComparison.OrdinalIgnoreCase))
             {
                 var partes = textoMensagem.Split(' ');
@@ -52,32 +55,8 @@ app.MapPost("/webhook", async (HttpContext context) =>
 
                         Console.WriteLine($"[SUCESSO] Voo {trecho} cadastrado para {telefone} com teto R$ {precoMaximo}");
                         
-                        // Aqui você poderia disparar o envio de mensagem de confirmação de volta no WhatsApp
-                    }
-                }
-            }
-            // 2. Comando LISTAR (Gera o texto pronto para o LinkedIn)
-            else if (textoMensagem.Equals("LISTAR", StringComparison.OrdinalIgnoreCase))
-            {
-                if (File.Exists(arquivoVoos))
-                {
-                    var jsonExistente = await File.ReadAllTextAsync(arquivoVoos);
-                    var voos = JsonSerializer.Deserialize<List<VooConfig>>(jsonExistente) ?? new();
-
-                    if (voos.Count > 0)
-                    {
-                        var sb = new StringBuilder();
-                        sb.AppendLine("🚀 *Voos Monitorados Atualmente:*");
-                        sb.AppendLine();
-                        foreach (var v in voos)
-                        {
-                            sb.AppendLine($"✈️ Trecho: *{v.Trecho}* | Teto Alvo: *R$ {v.PrecoMaximo:N2}*");
-                        }
-                        sb.AppendLine();
-                        sb.AppendLine("💡 _Desenvolvendo automações em C# e .NET para monitoramento de preços em tempo real! #dotnet #csharp #dev_");
-
-                        // Aqui imprimimos no console/logs para você ver o texto pronto
-                        Console.WriteLine("\n--- TEXTO PARA O LINKEDIN ---\n" + sb.ToString() + "\n-----------------------------\n");
+                        // Envia a resposta de volta no WhatsApp
+                        await EnviarMensagemWhatsAppAsync(remetente, $"✅ Alerta cadastrado com sucesso!\n\n✈️ Trecho: {trecho}\n💰 Preço Teto: R$ {precoMaximo:N2}");
                     }
                 }
             }
@@ -91,6 +70,29 @@ app.MapPost("/webhook", async (HttpContext context) =>
         return Results.BadRequest(new { erro = ex.Message });
     }
 });
+
+async Task EnviarMensagemWhatsAppAsync(string remoteJid, string mensagem)
+{
+    try
+    {
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("apikey", evolutionApiKey);
+
+        var payload = new
+        {
+            number = remoteJid,
+            text = mensagem
+        };
+
+        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        // Ajuste a URL base da sua Evolution API aqui se necessário
+        await client.PostAsync($"{evolutionApiUrl}/message/sendText/{instanceName}", content);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERRO AO ENVIAR WHATSAPP]: {ex.Message}");
+    }
+}
 
 app.Run();
 
