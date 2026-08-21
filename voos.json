@@ -1,8 +1,8 @@
 [
   {
     "Trecho": "MGF-AJU",
-    "PrecoMaximo": 10000,
+    "PrecoMaximo": 800,
     "Telefone": "557981394290",
-    "PendenteEnvio": false
+    "PendenteEnvio": true
   }
 ]
